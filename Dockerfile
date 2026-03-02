@@ -1,5 +1,5 @@
 # ==============================================================================
-# HeapVault 1.0 - PT Java Toolbox (Amazon Corretto 21 LTS)
+# kheap 1.0 - PT Java Toolbox (Amazon Corretto 21 LTS)
 #
 # Purpose:
 #   A platform-owned debug toolbox image to run inside Kubernetes as an

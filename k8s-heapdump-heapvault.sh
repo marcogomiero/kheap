@@ -1,20 +1,20 @@
 #!/usr/bin/env bash
 # ==============================================================================
-# k8s-heapdump-heapvault.sh
+# kheap
 #
-# HeapVault - Kubernetes JVM Heap Dump Tool (toolbox image)
+# kheap - Kubernetes JVM Heap Dump Tool (toolbox image)
 #
 # Default behavior:
-#   - REUSE ephemeral container named "heapvault" and keep it running.
-#   - If "heapvault" exists but is NOT running -> FAIL and require pod recreate.
+#   - REUSE ephemeral container named "kheap" and keep it running.
+#   - If "kheap" exists but is NOT running -> FAIL and require pod recreate.
 #   - Heap dump is performed with jattach (more reliable cross-container).
 #
 # USAGE
-#   ./k8s-heapdump-heapvault.sh -n <namespace> -p <pod> [-c <container>] \
+#   ./kheap -n <namespace> -p <pod> [-c <container>] \
 #       [-P <java_pid>] [-i <toolbox_image>] [-r <remote_dir>] [--no-gzip]
 #
 # DEFAULT TOOL IMAGE
-#   registry.dasrn.generali.it/gbs/spring-boot-demo:heapvault
+#   registry.dasrn.generali.it/gbs/spring-boot-demo:kheap
 # ==============================================================================
 
 set -euo pipefail
@@ -26,10 +26,10 @@ JAVA_PID=""
 REMOTE_DIR="/tmp"
 NO_GZIP=false
 
-DEFAULT_IMAGE="registry.dasrn.generali.it/gbs/spring-boot-demo:heapvault"
-TOOL_IMAGE="${HEAPVAULT_IMAGE:-$DEFAULT_IMAGE}"
+DEFAULT_IMAGE="registry.dasrn.generali.it/gbs/spring-boot-demo:kheap"
+TOOL_IMAGE="${KHEAP_IMAGE:-$DEFAULT_IMAGE}"
 
-DEBUG_CONTAINER="heapvault"
+DEBUG_CONTAINER="kheap"
 
 usage() {
   echo "Usage: $0 -n <namespace> -p <pod> [-c <container>] [-P <pid>] [-i <image>] [-r <remote_dir>] [--no-gzip]"
@@ -57,7 +57,7 @@ done
 
 [[ -z "$NS" || -z "$POD" ]] && { usage; die "Namespace and pod are required."; }
 
-log "Using HeapVault image: $TOOL_IMAGE"
+log "Using kheap image: $TOOL_IMAGE"
 log "Mode: REUSE (debug container name: $DEBUG_CONTAINER)"
 
 # -----------------------------
@@ -120,7 +120,7 @@ log "Preflight in debug container..."
 kubectl -n "$NS" exec "$POD" -c "$DEBUG_CONTAINER" -- sh -lc 'id' || true
 
 JATTACH_PATH="$(kubectl -n "$NS" exec "$POD" -c "$DEBUG_CONTAINER" -- sh -lc 'command -v jattach 2>/dev/null || true' 2>/dev/null || true)"
-[[ -z "$JATTACH_PATH" ]] && die "jattach not found in HeapVault container. Bake it into the image (recommended)."
+[[ -z "$JATTACH_PATH" ]] && die "jattach not found in kheap container. Bake it into the image (recommended)."
 log "jattach: $JATTACH_PATH"
 
 # -----------------------------
@@ -176,7 +176,7 @@ fi
 # Summary
 # -----------------------------
 echo
-echo "================ HEAPVAULT SUMMARY ================"
+echo "================== KHEAP SUMMARY =================="
 echo "Namespace        : $NS"
 echo "Pod              : $POD"
 echo "Target container : $CONTAINER"
