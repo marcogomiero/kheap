@@ -3,11 +3,11 @@
 # kheap
 #
 # Purpose:
-#   Collect a JVM heap dump from a Kubernetes pod.
+#   Collect a JVM thread dump and heap dump from a Kubernetes pod.
 #
 # Operating modes:
 #   1) DIRECT mode
-#      Try to execute the heap dump directly inside the target container
+#      Try to execute diagnostics directly inside the target container
 #      using tools already present there (jcmd or jattach).
 #
 #   2) DEBUG mode
@@ -15,9 +15,16 @@
 #      ephemeral toolbox container named "kheap", using jattach from that
 #      container.
 #
+# Thread dump collection (always attempted, cascading):
+#   1. jcmd Thread.print        (DIRECT, if jcmd available in target container)
+#   2. jattach threaddump       (DEBUG container, if running or after creation)
+#   3. kill -3 + kubectl logs   (universal fallback, any image)
+#   If all three methods fail, a warning is emitted and execution continues.
+#
 # Behavior:
 #   - Validates namespace, pod, target container and required local commands
 #   - Auto-detects Java PID if not explicitly provided
+#   - Collects thread dump (cascading, best-effort)
 #   - Creates heap dump inside the target container filesystem
 #   - Copies the heap dump locally
 #   - Verifies local/remote size match
@@ -28,6 +35,7 @@
 #   - DIRECT mode is best-effort only, because application containers may not
 #     contain the required Java diagnostic tools
 #   - DEBUG mode is the supported fallback for tool-poor images
+#   - Thread dump is always attempted regardless of --direct-only / --debug-only
 #
 # Requirements:
 #   - kubectl configured and authorized
@@ -76,6 +84,8 @@ LOCAL_HPROF=""
 LOCAL_GZ=""
 FINAL_FILE=""
 MODE_USED=""
+THREAD_DUMP_FILE=""
+THREAD_DUMP_METHOD=""
 
 usage() {
   cat <<EOF
@@ -97,12 +107,19 @@ Options:
 
 Environment:
   KHEAP_IMAGE        Override default toolbox image
+
+Thread dump:
+  Always attempted before the heap dump, in cascading order:
+    1. jcmd Thread.print  (if available in target container)
+    2. jattach threaddump (via debug container)
+    3. kill -3 + kubectl logs (universal fallback)
+  Failure is non-fatal: a warning is emitted and execution continues.
 EOF
 }
 
-log() { echo "[$(date '+%Y-%m-%d %H:%M:%S')] $*"; }
+log()  { echo "[$(date '+%Y-%m-%d %H:%M:%S')] $*"; }
 warn() { echo "[$(date '+%Y-%m-%d %H:%M:%S')] WARNING: $*" >&2; }
-die() { echo "ERROR: $*" >&2; exit 1; }
+die()  { echo "ERROR: $*" >&2; exit 1; }
 
 require_cmd() {
   local missing=0
@@ -145,10 +162,10 @@ while [[ $# -gt 0 ]]; do
     -i) TOOL_IMAGE="$2"; shift 2 ;;
     -r) REMOTE_DIR="$2"; shift 2 ;;
     -o) OUTPUT_DIR="$2"; shift 2 ;;
-    --no-gzip) NO_GZIP=true; shift 1 ;;
+    --no-gzip)     NO_GZIP=true;     shift 1 ;;
     --keep-remote) KEEP_REMOTE=true; shift 1 ;;
     --direct-only) DIRECT_ONLY=true; shift 1 ;;
-    --debug-only) DEBUG_ONLY=true; shift 1 ;;
+    --debug-only)  DEBUG_ONLY=true;  shift 1 ;;
     -h|--help) usage; exit 0 ;;
     *) usage; die "Unknown argument: $1" ;;
   esac
@@ -272,6 +289,100 @@ copy_with_retries() {
 
   [[ -f "$LOCAL_HPROF" ]] || die "Local heap dump file not found after copy."
   ls -lh "$LOCAL_HPROF"
+}
+
+# -----------------------------
+# Thread dump collection
+# Always attempted, cascading:
+#   1. jcmd Thread.print       (target container, DIRECT)
+#   2. jattach threaddump      (debug container)
+#   3. kill -3 + kubectl logs  (universal fallback)
+# Non-fatal: warns and returns on failure.
+# -----------------------------
+is_debug_container_running() {
+  kubectl -n "$NS" get pod "$POD" \
+    -o jsonpath="{range .status.ephemeralContainerStatuses[*]}{.name}:{.state.running.startedAt}{'\n'}{end}" \
+    2>/dev/null | awk -F: -v c="$DEBUG_CONTAINER" '$1==c && $2!="" {found=1} END {exit !found}'
+}
+
+collect_thread_dump() {
+  local pid="$1"
+  local out_file="${OUTPUT_DIR%/}/${NS}_${POD}_${TS}_threaddump.log"
+
+  log "Collecting thread dump for PID $pid..."
+
+  # ------------------------------------------------------------------
+  # Method 1: jcmd inside target container (skip if --debug-only)
+  # ------------------------------------------------------------------
+  if [[ "$DEBUG_ONLY" != true ]]; then
+    if kubectl -n "$NS" exec "$POD" -c "$CONTAINER" -- \
+        sh -lc 'command -v jcmd >/dev/null 2>&1' 2>/dev/null; then
+      log "Thread dump method 1: jcmd Thread.print (target container)..."
+      if kubectl -n "$NS" exec "$POD" -c "$CONTAINER" -- \
+          sh -lc "jcmd '$pid' Thread.print" > "$out_file" 2>/dev/null \
+          && [[ -s "$out_file" ]]; then
+        THREAD_DUMP_FILE="$out_file"
+        THREAD_DUMP_METHOD="jcmd (DIRECT)"
+        log "Thread dump saved: $out_file"
+        return 0
+      fi
+      warn "Thread dump method 1 (jcmd) failed, trying next..."
+      rm -f "$out_file" || true
+    fi
+  fi
+
+  # ------------------------------------------------------------------
+  # Method 2: jattach threaddump via debug container (skip if --direct-only)
+  # ------------------------------------------------------------------
+  if [[ "$DIRECT_ONLY" != true ]]; then
+    if is_debug_container_running; then
+      log "Thread dump method 2: jattach threaddump (debug container)..."
+      if kubectl -n "$NS" exec "$POD" -c "$DEBUG_CONTAINER" -- \
+          sh -lc "jattach '$pid' threaddump" > "$out_file" 2>/dev/null \
+          && [[ -s "$out_file" ]]; then
+        THREAD_DUMP_FILE="$out_file"
+        THREAD_DUMP_METHOD="jattach (DEBUG container)"
+        log "Thread dump saved: $out_file"
+        return 0
+      fi
+      warn "Thread dump method 2 (jattach) failed, trying next..."
+      rm -f "$out_file" || true
+    else
+      log "Thread dump method 2: debug container not running, skipping jattach."
+    fi
+  fi
+
+  # ------------------------------------------------------------------
+  # Method 3: kill -3 (SIGQUIT) + kubectl logs capture
+  # Works on any image as long as exec is allowed.
+  # ------------------------------------------------------------------
+  log "Thread dump method 3: kill -3 (SIGQUIT) + kubectl logs capture..."
+  local pre_ts
+  pre_ts="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+
+  if ! kubectl -n "$NS" exec "$POD" -c "$CONTAINER" -- \
+      sh -lc "kill -3 '$pid'" 2>/dev/null; then
+    warn "Thread dump method 3 (kill -3) failed: could not send SIGQUIT."
+    warn "Thread dump not collected."
+    return 0
+  fi
+
+  log "SIGQUIT sent. Waiting 3s for JVM to write thread dump to stdout..."
+  sleep 3
+
+  if kubectl -n "$NS" logs "$POD" -c "$CONTAINER" \
+      --since-time="$pre_ts" > "$out_file" 2>/dev/null \
+      && [[ -s "$out_file" ]]; then
+    THREAD_DUMP_FILE="$out_file"
+    THREAD_DUMP_METHOD="kill -3 / SIGQUIT (stdout capture)"
+    log "Thread dump saved: $out_file"
+    return 0
+  fi
+
+  rm -f "$out_file" || true
+  warn "Thread dump method 3 (kubectl logs capture) produced empty output."
+  warn "Thread dump not collected."
+  return 0
 }
 
 # -----------------------------
@@ -464,7 +575,7 @@ run_debug_mode() {
 }
 
 # -----------------------------
-# Mode selection
+# Mode selection (heap dump)
 # -----------------------------
 if [[ "$DEBUG_ONLY" = true ]]; then
   run_debug_mode
@@ -478,6 +589,11 @@ else
     run_debug_mode
   fi
 fi
+
+# -----------------------------
+# Thread dump (always, cascading, after PID is known)
+# -----------------------------
+collect_thread_dump "$JAVA_PID"
 
 # -----------------------------
 # Copy / verify / compress / cleanup
@@ -498,7 +614,13 @@ echo "Pod              : $POD"
 echo "Target container : $CONTAINER"
 echo "Java PID         : $JAVA_PID"
 echo "Remote file      : $REMOTE_HPROF"
-echo "Local file       : $FINAL_FILE"
+echo "Local heap dump  : $FINAL_FILE"
+if [[ -n "$THREAD_DUMP_FILE" ]]; then
+  echo "Thread dump      : $THREAD_DUMP_FILE"
+  echo "Thread dump via  : $THREAD_DUMP_METHOD"
+else
+  echo "Thread dump      : not collected"
+fi
 if [[ "$MODE_USED" = "DEBUG" ]]; then
   echo "Debug container  : $DEBUG_CONTAINER (REUSE, kept running)"
   echo "Tool image       : $TOOL_IMAGE"
