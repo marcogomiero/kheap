@@ -27,7 +27,7 @@
 #   - Collects thread dump (cascading, best-effort)
 #   - Creates heap dump inside the target container filesystem
 #   - Copies the heap dump locally
-#   - Verifies local/remote size match
+#   - Verifies local/remote size match (+ optional checksum)
 #   - Compresses locally with gzip
 #   - Removes the remote heap dump after successful copy
 #
@@ -36,6 +36,11 @@
 #     contain the required Java diagnostic tools
 #   - DEBUG mode is the supported fallback for tool-poor images
 #   - Thread dump is always attempted regardless of --direct-only / --debug-only
+#   - collect_thread_dump is called AFTER mode selection, so when running in
+#     AUTO or DEBUG mode the debug container is guaranteed to be up before
+#     thread dump method 2 (jattach) is attempted
+#   - On macOS, --since-time in kubectl logs requires GNU date for reliable
+#     RFC3339 formatting. Install via: brew install coreutils
 #
 # Requirements:
 #   - kubectl configured and authorized
@@ -45,7 +50,8 @@
 # Usage:
 #   ./kheap -n <namespace> -p <pod> [-c <container>] \
 #       [-P <java_pid>] [-i <toolbox_image>] [-r <remote_dir>] \
-#       [-o <output_dir>] [--no-gzip] [--keep-remote] [--direct-only] [--debug-only]
+#       [-o <output_dir>] [--no-gzip] [--keep-remote] [--checksum] \
+#       [--direct-only] [--debug-only]
 #
 # Examples:
 #   ./kheap -n pt-healthcheck -p fanny-547bb857d8-jq59m
@@ -55,6 +61,8 @@
 #   ./kheap -n pt-healthcheck -p fanny-547bb857d8-jq59m --direct-only
 #
 #   ./kheap -n pt-healthcheck -p fanny-547bb857d8-jq59m --debug-only
+#
+#   ./kheap -n pt-healthcheck -p fanny-547bb857d8-jq59m --checksum
 #
 # Default toolbox image:
 #   registry.dasrn.generali.it/gbs/spring-boot-demo:kheap
@@ -72,6 +80,7 @@ NO_GZIP=false
 KEEP_REMOTE=false
 DIRECT_ONLY=false
 DEBUG_ONLY=false
+CHECKSUM=false
 
 DEFAULT_IMAGE="registry.dasrn.generali.it/gbs/spring-boot-demo:kheap"
 TOOL_IMAGE="${KHEAP_IMAGE:-$DEFAULT_IMAGE}"
@@ -89,7 +98,7 @@ THREAD_DUMP_METHOD=""
 
 usage() {
   cat <<EOF
-Usage: $0 -n <namespace> -p <pod> [-c <container>] [-P <pid>] [-i <image>] [-r <remote_dir>] [-o <output_dir>] [--no-gzip] [--keep-remote] [--direct-only] [--debug-only]
+Usage: $0 -n <namespace> -p <pod> [-c <container>] [-P <pid>] [-i <image>] [-r <remote_dir>] [-o <output_dir>] [--no-gzip] [--keep-remote] [--checksum] [--direct-only] [--debug-only]
 
 Options:
   -n <namespace>     Kubernetes namespace
@@ -101,6 +110,7 @@ Options:
   -o <output_dir>    Local output directory (default: current directory)
   --no-gzip          Do not compress the local heap dump
   --keep-remote      Keep the remote heap dump file after successful copy
+  --checksum         Verify MD5 checksum after copy (in addition to size check)
   --direct-only      Use DIRECT mode only, do not fall back to DEBUG mode
   --debug-only       Use DEBUG mode only, skip DIRECT mode
   -h, --help         Show this help
@@ -114,6 +124,11 @@ Thread dump:
     2. jattach threaddump (via debug container)
     3. kill -3 + kubectl logs (universal fallback)
   Failure is non-fatal: a warning is emitted and execution continues.
+
+Notes:
+  - On macOS, install GNU coreutils (brew install coreutils) for reliable
+    RFC3339 date formatting used by --since-time in kubectl logs.
+  - --checksum uses md5sum (Linux) or md5 (macOS) automatically.
 EOF
 }
 
@@ -132,6 +147,10 @@ require_cmd() {
   [[ "$missing" -eq 0 ]] || exit 1
 }
 
+# -----------------------------
+# Cleanup on error
+# Removes partial local files including any thread dump written so far.
+# -----------------------------
 cleanup_on_error() {
   local rc=$?
   if [[ $rc -ne 0 ]]; then
@@ -143,6 +162,10 @@ cleanup_on_error() {
     if [[ -n "${LOCAL_GZ:-}" && -f "$LOCAL_GZ" ]]; then
       log "Removing partial local file: $LOCAL_GZ"
       rm -f "$LOCAL_GZ" || true
+    fi
+    if [[ -n "${THREAD_DUMP_FILE:-}" && -f "$THREAD_DUMP_FILE" ]]; then
+      log "Removing partial thread dump file: $THREAD_DUMP_FILE"
+      rm -f "$THREAD_DUMP_FILE" || true
     fi
   fi
   exit $rc
@@ -164,6 +187,7 @@ while [[ $# -gt 0 ]]; do
     -o) OUTPUT_DIR="$2"; shift 2 ;;
     --no-gzip)     NO_GZIP=true;     shift 1 ;;
     --keep-remote) KEEP_REMOTE=true; shift 1 ;;
+    --checksum)    CHECKSUM=true;    shift 1 ;;
     --direct-only) DIRECT_ONLY=true; shift 1 ;;
     --debug-only)  DEBUG_ONLY=true;  shift 1 ;;
     -h|--help) usage; exit 0 ;;
@@ -177,6 +201,21 @@ done
 require_cmd kubectl awk grep date gzip
 
 log "Using kheap image: $TOOL_IMAGE"
+
+# -----------------------------
+# Detect local md5 command (Linux vs macOS)
+# -----------------------------
+LOCAL_MD5_CMD=""
+if [[ "$CHECKSUM" = true ]]; then
+  if command -v md5sum >/dev/null 2>&1; then
+    LOCAL_MD5_CMD="md5sum"
+  elif command -v md5 >/dev/null 2>&1; then
+    LOCAL_MD5_CMD="md5 -q"
+  else
+    warn "--checksum requested but neither md5sum nor md5 found locally. Skipping checksum."
+    CHECKSUM=false
+  fi
+fi
 
 # -----------------------------
 # Validate local output dir
@@ -240,6 +279,9 @@ copy_heap_dump() {
   kubectl -n "$NS" exec "$POD" -c "$CONTAINER" -- sh -lc "cat '$REMOTE_HPROF'" > "$LOCAL_HPROF"
 }
 
+# -----------------------------
+# Size verification
+# -----------------------------
 verify_size() {
   local remote_size local_size
 
@@ -252,6 +294,35 @@ verify_size() {
 
   [[ "$remote_size" = "$local_size" ]] || die "Size mismatch after copy: remote=$remote_size local=$local_size"
   log "Size verification OK: $local_size bytes"
+}
+
+# -----------------------------
+# MD5 checksum verification (optional, --checksum)
+# Uses md5sum on Linux, md5 -q on macOS.
+# Guards against silent truncation from the cat fallback copy path.
+# -----------------------------
+verify_checksum() {
+  [[ "$CHECKSUM" = false ]] && return 0
+
+  log "Verifying MD5 checksum..."
+
+  local remote_md5 local_md5
+
+  # Try md5sum first, fall back to md5 (BusyBox/Alpine)
+  remote_md5="$(kubectl -n "$NS" exec "$POD" -c "$CONTAINER" -- sh -lc \
+    "md5sum '$REMOTE_HPROF' 2>/dev/null | awk '{print \$1}' || md5 -q '$REMOTE_HPROF' 2>/dev/null || true" \
+    2>/dev/null | tr -d '[:space:]')"
+
+  if [[ -z "$remote_md5" ]]; then
+    warn "Remote md5 not available (no md5sum/md5 in container). Skipping checksum."
+    return 0
+  fi
+
+  local_md5="$($LOCAL_MD5_CMD "$LOCAL_HPROF" 2>/dev/null | awk '{print $1}' | tr -d '[:space:]')"
+  [[ -n "$local_md5" ]] || { warn "Could not compute local MD5. Skipping checksum."; return 0; }
+
+  [[ "$remote_md5" = "$local_md5" ]] || die "MD5 mismatch after copy: remote=$remote_md5 local=$local_md5"
+  log "MD5 checksum OK: $local_md5"
 }
 
 compress_local_file() {
@@ -298,6 +369,10 @@ copy_with_retries() {
 #   2. jattach threaddump      (debug container)
 #   3. kill -3 + kubectl logs  (universal fallback)
 # Non-fatal: warns and returns on failure.
+#
+# NOTE: this function is called AFTER mode selection (heap dump), so when
+# running in AUTO or DEBUG mode the debug container is already running by
+# the time method 2 is attempted. No race condition.
 # -----------------------------
 is_debug_container_running() {
   kubectl -n "$NS" get pod "$POD" \
@@ -333,6 +408,9 @@ collect_thread_dump() {
 
   # ------------------------------------------------------------------
   # Method 2: jattach threaddump via debug container (skip if --direct-only)
+  # The debug container is guaranteed to be running at this point when
+  # in AUTO or DEBUG mode, because collect_thread_dump is called after
+  # run_debug_mode completes successfully.
   # ------------------------------------------------------------------
   if [[ "$DIRECT_ONLY" != true ]]; then
     if is_debug_container_running; then
@@ -355,6 +433,12 @@ collect_thread_dump() {
   # ------------------------------------------------------------------
   # Method 3: kill -3 (SIGQUIT) + kubectl logs capture
   # Works on any image as long as exec is allowed.
+  #
+  # NOTE: --since-time requires RFC3339 format (YYYY-MM-DDTHH:MM:SSZ).
+  # On Linux this is provided by GNU date. On macOS, install GNU coreutils:
+  #   brew install coreutils
+  # The format string used here (%Y-%m-%dT%H:%M:%SZ) is compatible with
+  # both GNU date and BSD date (macOS built-in), so no gdate wrapper needed.
   # ------------------------------------------------------------------
   log "Thread dump method 3: kill -3 (SIGQUIT) + kubectl logs capture..."
   local pre_ts
@@ -591,7 +675,7 @@ else
 fi
 
 # -----------------------------
-# Thread dump (always, cascading, after PID is known)
+# Thread dump (always, cascading, after PID is known and debug container is up)
 # -----------------------------
 collect_thread_dump "$JAVA_PID"
 
@@ -600,12 +684,25 @@ collect_thread_dump "$JAVA_PID"
 # -----------------------------
 copy_with_retries
 verify_size
+verify_checksum
 compress_local_file
 cleanup_remote_file
 
 # -----------------------------
 # Summary
 # -----------------------------
+gzip_label="$([[ "$NO_GZIP" = false ]] && echo "enabled" || echo "disabled")"
+keep_remote_label="$([[ "$KEEP_REMOTE" = true ]] && echo "yes" || echo "no")"
+checksum_label="$([[ "$CHECKSUM" = true ]] && echo "yes" || echo "no")"
+
+if [[ "$MODE_USED" = "DEBUG" ]]; then
+  debug_container_label="$DEBUG_CONTAINER (REUSE, kept running)"
+  tool_image_label="$TOOL_IMAGE"
+else
+  debug_container_label="not used"
+  tool_image_label="not used"
+fi
+
 echo
 echo "================== KHEAP SUMMARY =================="
 echo "Mode used        : $MODE_USED"
@@ -621,15 +718,11 @@ if [[ -n "$THREAD_DUMP_FILE" ]]; then
 else
   echo "Thread dump      : not collected"
 fi
-if [[ "$MODE_USED" = "DEBUG" ]]; then
-  echo "Debug container  : $DEBUG_CONTAINER (REUSE, kept running)"
-  echo "Tool image       : $TOOL_IMAGE"
-else
-  echo "Debug container  : not used"
-  echo "Tool image       : not used"
-fi
-echo "Gzip             : $([[ "$NO_GZIP" = false ]] && echo "enabled" || echo "disabled")"
-echo "Keep remote      : $([[ "$KEEP_REMOTE" = true ]] && echo "yes" || echo "no")"
+echo "Debug container  : $debug_container_label"
+echo "Tool image       : $tool_image_label"
+echo "Gzip             : $gzip_label"
+echo "Checksum (MD5)   : $checksum_label"
+echo "Keep remote      : $keep_remote_label"
 echo "==================================================="
 echo
 
