@@ -92,9 +92,21 @@ REMOTE_HPROF=""
 LOCAL_HPROF=""
 LOCAL_GZ=""
 FINAL_FILE=""
+
+# Globals mutated by run_direct_mode / run_debug_mode:
+#   MODE_USED   - "DIRECT" or "DEBUG"
+#   JAVA_PID    - resolved Java PID (may be overwritten from auto-detect)
 MODE_USED=""
+
+# Globals mutated by collect_thread_dump:
+#   THREAD_DUMP_FILE   - path to saved thread dump file (empty if not collected)
+#   THREAD_DUMP_METHOD - human-readable label of the method used
 THREAD_DUMP_FILE=""
 THREAD_DUMP_METHOD=""
+
+# Track whether the final output file is complete and safe to keep.
+# Set to true only after copy + verify succeed.
+OUTPUT_COMPLETE=false
 
 usage() {
   cat <<EOF
@@ -149,25 +161,34 @@ require_cmd() {
 
 # -----------------------------
 # Cleanup on error
-# Removes partial local files including any thread dump written so far.
+#
+# Removes partial local files ONLY if the output was not yet marked complete.
+# Thread dump files are always removed on error (they may be partial).
+# The final compressed file is never removed here: if we reached compression,
+# the data was already verified and the uncompressed source is gone.
 # -----------------------------
 cleanup_on_error() {
   local rc=$?
-  if [[ $rc -ne 0 ]]; then
-    log "Script failed (rc=$rc)."
+  [[ $rc -eq 0 ]] && exit 0
+
+  log "Script failed (rc=$rc). Cleaning up partial files..."
+
+  if [[ "$OUTPUT_COMPLETE" = false ]]; then
     if [[ -n "${LOCAL_HPROF:-}" && -f "$LOCAL_HPROF" ]]; then
       log "Removing partial local file: $LOCAL_HPROF"
       rm -f "$LOCAL_HPROF" || true
     fi
     if [[ -n "${LOCAL_GZ:-}" && -f "$LOCAL_GZ" ]]; then
-      log "Removing partial local file: $LOCAL_GZ"
+      log "Removing partial compressed file: $LOCAL_GZ"
       rm -f "$LOCAL_GZ" || true
     fi
-    if [[ -n "${THREAD_DUMP_FILE:-}" && -f "$THREAD_DUMP_FILE" ]]; then
-      log "Removing partial thread dump file: $THREAD_DUMP_FILE"
-      rm -f "$THREAD_DUMP_FILE" || true
-    fi
   fi
+
+  if [[ -n "${THREAD_DUMP_FILE:-}" && -f "$THREAD_DUMP_FILE" ]]; then
+    log "Removing partial thread dump file: $THREAD_DUMP_FILE"
+    rm -f "$THREAD_DUMP_FILE" || true
+  fi
+
   exit $rc
 }
 
@@ -261,13 +282,18 @@ validate_remote_dir() {
   " >/dev/null || return 1
 }
 
+# Matches only the java binary (absolute or basename) to avoid false positives
+# from processes like 'javaagent-wrapper' or 'java-service-proxy'.
 detect_java_pid_in_container() {
   kubectl -n "$NS" exec "$POD" -c "$CONTAINER" -- sh -lc \
-    "ps -eo pid,args 2>/dev/null | awk '/[j]ava/ {print \$1; exit}'" 2>/dev/null || true
+    "ps -eo pid,args 2>/dev/null | awk '\$2==\"java\" || \$2 ~ /\\/java\$/ {print \$1; exit}'" \
+    2>/dev/null || true
 }
 
+# Uses 'test -s' instead of 'ls': verifies existence and non-zero size,
+# more reliable across minimal shell environments.
 verify_remote_file_exists() {
-  kubectl -n "$NS" exec "$POD" -c "$CONTAINER" -- sh -lc "ls -lh '$REMOTE_HPROF'" >/dev/null 2>&1
+  kubectl -n "$NS" exec "$POD" -c "$CONTAINER" -- sh -lc "test -s '$REMOTE_HPROF'" >/dev/null 2>&1
 }
 
 copy_heap_dump() {
@@ -346,14 +372,27 @@ cleanup_remote_file() {
   fi
 }
 
+# -----------------------------
+# copy_with_retries
+#
+# Uses an explicit counter loop instead of brace expansion {1..12} to avoid
+# unreliable arithmetic exit codes under set -euo pipefail.
+# -----------------------------
 copy_with_retries() {
+  local attempt=0
+  local max=12
+
   log "Copying heap dump locally to: $LOCAL_HPROF"
-  for i in {1..12}; do
+
+  while (( attempt < max )); do
+    (( attempt++ )) || true
     if copy_heap_dump; then
       break
     fi
-    [[ $i -eq 12 ]] && die "Copy failed after 12 retries."
-    log "Copy failed. Retrying ($i/12) in 5s..."
+    if (( attempt == max )); then
+      die "Copy failed after $max retries."
+    fi
+    log "Copy failed. Retrying ($attempt/$max) in 5s..."
     rm -f "$LOCAL_HPROF" || true
     sleep 5
   done
@@ -369,6 +408,8 @@ copy_with_retries() {
 #   2. jattach threaddump      (debug container)
 #   3. kill -3 + kubectl logs  (universal fallback)
 # Non-fatal: warns and returns on failure.
+#
+# Mutates globals: THREAD_DUMP_FILE, THREAD_DUMP_METHOD
 #
 # NOTE: this function is called AFTER mode selection (heap dump), so when
 # running in AUTO or DEBUG mode the debug container is already running by
@@ -434,6 +475,12 @@ collect_thread_dump() {
   # Method 3: kill -3 (SIGQUIT) + kubectl logs capture
   # Works on any image as long as exec is allowed.
   #
+  # IMPORTANT: Before sending SIGQUIT, verify that the PID is visible
+  # inside the target container's PID namespace. If JAVA_PID was
+  # auto-detected from the debug container (which may share the host
+  # PID namespace), the PID could differ inside the target container,
+  # and kill -3 could signal the wrong process.
+  #
   # NOTE: --since-time requires RFC3339 format (YYYY-MM-DDTHH:MM:SSZ).
   # On Linux this is provided by GNU date. On macOS, install GNU coreutils:
   #   brew install coreutils
@@ -441,6 +488,15 @@ collect_thread_dump() {
   # both GNU date and BSD date (macOS built-in), so no gdate wrapper needed.
   # ------------------------------------------------------------------
   log "Thread dump method 3: kill -3 (SIGQUIT) + kubectl logs capture..."
+
+  # Verify PID is accessible in target container before sending signal.
+  if ! kubectl -n "$NS" exec "$POD" -c "$CONTAINER" -- \
+      sh -lc "ls /proc/$pid/exe >/dev/null 2>&1" 2>/dev/null; then
+    warn "PID $pid not visible in target container's PID namespace. Skipping kill -3."
+    warn "Thread dump not collected."
+    return 0
+  fi
+
   local pre_ts
   pre_ts="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
 
@@ -484,6 +540,7 @@ direct_detect_tool() {
   ' 2>/dev/null || true
 }
 
+# Mutates globals: JAVA_PID, MODE_USED
 run_direct_mode() {
   local tool=""
   local pid=""
@@ -547,6 +604,13 @@ run_direct_mode() {
 # -----------------------------
 # DEBUG mode helpers
 # -----------------------------
+
+# ensure_debug_container_running
+#
+# Checks whether the ephemeral debug container already exists and is running.
+# If it exists but is not running (terminated/waiting), dies with a clear message.
+# If it does not exist, creates it via kubectl debug and waits up to 120s.
+# Detects unexpected termination during the wait loop and dies immediately.
 ensure_debug_container_running() {
   local exists_in_spec=""
   local running_state=""
@@ -587,28 +651,46 @@ ensure_debug_container_running() {
 
   [[ -n "$debug_output" ]] && echo "$debug_output"
 
-  log "DEBUG mode: waiting for debug container '$DEBUG_CONTAINER' to be Running..."
-  for i in {1..60}; do
-    eph_status="$(kubectl -n "$NS" get pod "$POD" -o jsonpath="{range .status.ephemeralContainerStatuses[*]}{.name} running={.state.running.startedAt} waiting={.state.waiting.reason} terminated={.state.terminated.reason}{'\n'}{end}" 2>/dev/null || true)"
-    [[ -n "$eph_status" ]] && log "DEBUG mode status check $i/60: $(echo "$eph_status" | tr '\n' '; ')"
+  log "DEBUG mode: waiting for debug container '$DEBUG_CONTAINER' to be Running (max 120s)..."
 
-    running="$(kubectl -n "$NS" get pod "$POD" -o jsonpath="{range .status.ephemeralContainerStatuses[*]}{.name}:{.state.running.startedAt}{'\n'}{end}" 2>/dev/null | awk -F: -v c="$DEBUG_CONTAINER" '$1==c && $2!="" {print $2}')"
+  local i=0
+  local max_wait=60  # iterations x 2s = 120s
+  while (( i < max_wait )); do
+    (( i++ )) || true
+
+    eph_status="$(kubectl -n "$NS" get pod "$POD" \
+      -o jsonpath="{range .status.ephemeralContainerStatuses[*]}{.name} running={.state.running.startedAt} waiting={.state.waiting.reason} terminated={.state.terminated.reason}{'\n'}{end}" \
+      2>/dev/null || true)"
+    [[ -n "$eph_status" ]] && log "DEBUG mode status check $i/$max_wait: $(echo "$eph_status" | tr '\n' '; ')"
+
+    # Fail immediately if the container has already terminated.
+    if echo "$eph_status" | grep -q "^${DEBUG_CONTAINER} .*terminated=[^[:space:]]"; then
+      kubectl -n "$NS" describe pod "$POD" >&2 || true
+      die "Debug container '$DEBUG_CONTAINER' terminated unexpectedly. Check image or cluster policy."
+    fi
+
+    running="$(kubectl -n "$NS" get pod "$POD" \
+      -o jsonpath="{range .status.ephemeralContainerStatuses[*]}{.name}:{.state.running.startedAt}{'\n'}{end}" \
+      2>/dev/null | awk -F: -v c="$DEBUG_CONTAINER" '$1==c && $2!="" {print $2}')"
     [[ -n "$running" ]] && break
+
+    if (( i == max_wait )); then
+      kubectl -n "$NS" describe pod "$POD" >&2 || true
+      die "Timeout waiting for debug container '$DEBUG_CONTAINER' to start (120s elapsed)."
+    fi
+
     sleep 2
   done
 
-  running="$(kubectl -n "$NS" get pod "$POD" -o jsonpath="{range .status.ephemeralContainerStatuses[*]}{.name}:{.state.running.startedAt}{'\n'}{end}" 2>/dev/null | awk -F: -v c="$DEBUG_CONTAINER" '$1==c && $2!="" {print $2}')"
-  if [[ -z "$running" ]]; then
-    kubectl -n "$NS" describe pod "$POD" >&2 || true
-    die "Debug container '$DEBUG_CONTAINER' is not running."
-  fi
+  log "DEBUG mode: debug container '$DEBUG_CONTAINER' is Running."
 }
 
 debug_detect_java_pid() {
   local pid=""
 
   pid="$(kubectl -n "$NS" exec "$POD" -c "$DEBUG_CONTAINER" -- sh -lc \
-    "ps -eo pid,args 2>/dev/null | awk '/[j]ava/ {print \$1; exit}'" 2>/dev/null || true)"
+    "ps -eo pid,args 2>/dev/null | awk '\$2==\"java\" || \$2 ~ /\\/java\$/ {print \$1; exit}'" \
+    2>/dev/null || true)"
 
   if [[ -z "$pid" ]]; then
     log "DEBUG mode: Java PID not visible from debug container, trying target container..."
@@ -618,6 +700,7 @@ debug_detect_java_pid() {
   echo "$pid"
 }
 
+# Mutates globals: JAVA_PID, MODE_USED
 run_debug_mode() {
   local debug_id=""
   local jattach_path=""
@@ -681,10 +764,13 @@ collect_thread_dump "$JAVA_PID"
 
 # -----------------------------
 # Copy / verify / compress / cleanup
+# Mark output complete only after verify succeeds, so cleanup_on_error
+# does not delete a fully verified heap dump if a later step fails.
 # -----------------------------
 copy_with_retries
 verify_size
 verify_checksum
+OUTPUT_COMPLETE=true
 compress_local_file
 cleanup_remote_file
 
