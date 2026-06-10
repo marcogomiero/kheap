@@ -286,14 +286,24 @@ validate_remote_dir() {
 # from processes like 'javaagent-wrapper' or 'java-service-proxy'.
 detect_java_pid_in_container() {
   kubectl -n "$NS" exec "$POD" -c "$CONTAINER" -- sh -lc \
-    "ps -eo pid,args 2>/dev/null | awk '\$2==\"java\" || \$2 ~ /\\/java\$/ {print \$1; exit}'" \
+    "ps -eo pid,args 2>/dev/null | awk '\$2==\"java\" || \$2 ~ /\/java\$/ {print \$1; exit}'" \
     2>/dev/null || true
 }
 
 # Uses 'test -s' instead of 'ls': verifies existence and non-zero size,
 # more reliable across minimal shell environments.
+#
+# Distinguishes two failure cases:
+#   - exec itself fails (RBAC, network, pod not reachable): warns and returns 2
+#   - exec succeeds but file is absent or empty: returns 1
 verify_remote_file_exists() {
-  kubectl -n "$NS" exec "$POD" -c "$CONTAINER" -- sh -lc "test -s '$REMOTE_HPROF'" >/dev/null 2>&1
+  local exec_out
+  if ! exec_out="$(kubectl -n "$NS" exec "$POD" -c "$CONTAINER" -- sh -lc "test -s '$REMOTE_HPROF' && echo ok" 2>&1)"; then
+    warn "verify_remote_file_exists: exec into container failed: $exec_out"
+    return 2
+  fi
+  [[ "$exec_out" = "ok" ]] || return 1
+  return 0
 }
 
 copy_heap_dump() {
@@ -353,9 +363,12 @@ verify_checksum() {
 
 compress_local_file() {
   if [[ "$NO_GZIP" = false ]]; then
+    # Set FINAL_FILE before invoking gzip: if gzip dies mid-run the cleanup
+    # handler knows which file to look for, and the uncompressed source will
+    # already be gone (gzip removes it in-place).
+    FINAL_FILE="$LOCAL_GZ"
     log "Compressing locally..."
     gzip -9 -f "$LOCAL_HPROF"
-    FINAL_FILE="$LOCAL_GZ"
     ls -lh "$FINAL_FILE"
   else
     FINAL_FILE="$LOCAL_HPROF"
@@ -397,8 +410,9 @@ verify_local_space() {
 # -----------------------------
 # copy_with_retries
 #
-# Uses an explicit counter loop instead of brace expansion {1..12} to avoid
-# unreliable arithmetic exit codes under set -euo pipefail.
+# Uses $(( )) arithmetic instead of (( )) to avoid unreliable exit codes
+# under set -euo pipefail: (( expr )) returns 1 when the result is zero
+# (e.g. post-increment of 0), which trips set -e even with || true guards.
 # -----------------------------
 copy_with_retries() {
   local attempt=0
@@ -406,12 +420,12 @@ copy_with_retries() {
 
   log "Copying heap dump locally to: $LOCAL_HPROF"
 
-  while (( attempt < max )); do
-    (( attempt++ )) || true
+  while [[ "$attempt" -lt "$max" ]]; do
+    attempt=$(( attempt + 1 ))
     if copy_heap_dump; then
       break
     fi
-    if (( attempt == max )); then
+    if [[ "$attempt" -eq "$max" ]]; then
       die "Copy failed after $max retries."
     fi
     log "Copy failed. Retrying ($attempt/$max) in 5s..."
@@ -550,8 +564,14 @@ collect_thread_dump() {
 # -----------------------------
 # DIRECT mode helpers
 # -----------------------------
+
+# Returns the first available diagnostic tool found in the target container:
+# "jcmd", "jattach", or "none".
+# Always returns one of these three strings; never returns empty string.
+# The "none" case is handled by the caller (run_direct_mode returns 1).
 direct_detect_tool() {
-  kubectl -n "$NS" exec "$POD" -c "$CONTAINER" -- sh -lc '
+  local tool
+  tool="$(kubectl -n "$NS" exec "$POD" -c "$CONTAINER" -- sh -lc '
     if command -v jcmd >/dev/null 2>&1; then
       echo jcmd
     elif command -v jattach >/dev/null 2>&1; then
@@ -559,7 +579,10 @@ direct_detect_tool() {
     else
       echo none
     fi
-  ' 2>/dev/null || true
+  ' 2>/dev/null)" || true
+
+  # Normalize: if exec failed entirely, tool will be empty; treat as none.
+  echo "${tool:-none}"
 }
 
 # Mutates globals: JAVA_PID, MODE_USED
@@ -575,7 +598,6 @@ run_direct_mode() {
   }
 
   tool="$(direct_detect_tool)"
-  [[ -n "$tool" ]] || tool="none"
 
   if [[ "$tool" = "none" ]]; then
     warn "DIRECT mode: neither jcmd nor jattach found in target container."
@@ -613,10 +635,15 @@ run_direct_mode() {
       }
   fi
 
-  verify_remote_file_exists || {
+  local verify_rc
+  verify_remote_file_exists; verify_rc=$?
+  if [[ "$verify_rc" -eq 2 ]]; then
+    warn "DIRECT mode: could not exec into container to verify heap dump."
+    return 1
+  elif [[ "$verify_rc" -ne 0 ]]; then
     warn "DIRECT mode: heap dump file not found after dump."
     return 1
-  }
+  fi
 
   JAVA_PID="$pid"
   MODE_USED="DIRECT"
@@ -677,8 +704,8 @@ ensure_debug_container_running() {
 
   local i=0
   local max_wait=60  # iterations x 2s = 120s
-  while (( i < max_wait )); do
-    (( i++ )) || true
+  while [[ "$i" -lt "$max_wait" ]]; do
+    i=$(( i + 1 ))
 
     eph_status="$(kubectl -n "$NS" get pod "$POD" \
       -o jsonpath="{range .status.ephemeralContainerStatuses[*]}{.name} running={.state.running.startedAt} waiting={.state.waiting.reason} terminated={.state.terminated.reason}{'\n'}{end}" \
@@ -696,7 +723,7 @@ ensure_debug_container_running() {
       2>/dev/null | awk -F: -v c="$DEBUG_CONTAINER" '$1==c && $2!="" {print $2}')"
     [[ -n "$running" ]] && break
 
-    if (( i == max_wait )); then
+    if [[ "$i" -eq "$max_wait" ]]; then
       kubectl -n "$NS" describe pod "$POD" >&2 || true
       die "Timeout waiting for debug container '$DEBUG_CONTAINER' to start (120s elapsed)."
     fi
@@ -711,7 +738,7 @@ debug_detect_java_pid() {
   local pid=""
 
   pid="$(kubectl -n "$NS" exec "$POD" -c "$DEBUG_CONTAINER" -- sh -lc \
-    "ps -eo pid,args 2>/dev/null | awk '\$2==\"java\" || \$2 ~ /\\/java\$/ {print \$1; exit}'" \
+    "ps -eo pid,args 2>/dev/null | awk '\$2==\"java\" || \$2 ~ /\/java\$/ {print \$1; exit}'" \
     2>/dev/null || true)"
 
   if [[ -z "$pid" ]]; then
@@ -756,7 +783,13 @@ run_debug_mode() {
     "$jattach_path '$pid' dumpheap '$REMOTE_HPROF'" \
     || die "Heap dump failed. Cluster policy may block attach/ptrace even for root."
 
-  verify_remote_file_exists || die "Heap dump file not found in target container at '$REMOTE_HPROF'."
+  local verify_rc
+  verify_remote_file_exists; verify_rc=$?
+  if [[ "$verify_rc" -eq 2 ]]; then
+    die "Could not exec into target container to verify heap dump at '$REMOTE_HPROF'."
+  elif [[ "$verify_rc" -ne 0 ]]; then
+    die "Heap dump file not found in target container at '$REMOTE_HPROF'."
+  fi
 
   JAVA_PID="$pid"
   MODE_USED="DEBUG"
@@ -799,6 +832,8 @@ cleanup_remote_file
 
 # -----------------------------
 # Summary
+# NOTE: the MODE_USED check below covers DIRECT and DEBUG only.
+# If a third mode is ever added, update this block accordingly.
 # -----------------------------
 gzip_label="$([[ "$NO_GZIP" = false ]] && echo "enabled" || echo "disabled")"
 keep_remote_label="$([[ "$KEEP_REMOTE" = true ]] && echo "yes" || echo "no")"
