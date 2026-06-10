@@ -372,6 +372,28 @@ cleanup_remote_file() {
   fi
 }
 
+verify_local_space() {
+  local remote_size local_free needed
+
+  remote_size="$(kubectl -n "$NS" exec "$POD" -c "$CONTAINER" -- \
+    sh -c "wc -c < '$REMOTE_HPROF'" 2>/dev/null | tr -d '[:space:]')"
+  [[ -n "$remote_size" ]] || { warn "Cannot determine remote size, skipping space check."; return 0; }
+
+  local_free="$(df -Pk "$OUTPUT_DIR" | awk 'NR==2 {print $4 * 1024}')"
+  [[ -n "$local_free" ]] || { warn "Cannot determine local free space, skipping check."; return 0; }
+
+  # Without --no-gzip we need room for hprof + gz simultaneously during compression.
+  # gz worst case ~= original size, so require 2x. With --no-gzip, 1.1x margin.
+  if [[ "$NO_GZIP" = false ]]; then
+    needed=$(( remote_size * 2 ))
+  else
+    needed=$(( remote_size + remote_size / 10 ))
+  fi
+
+  (( local_free > needed )) || \
+    die "Insufficient local space in $OUTPUT_DIR: need ~$needed bytes, have $local_free."
+}
+
 # -----------------------------
 # copy_with_retries
 #
@@ -767,6 +789,7 @@ collect_thread_dump "$JAVA_PID"
 # Mark output complete only after verify succeeds, so cleanup_on_error
 # does not delete a fully verified heap dump if a later step fails.
 # -----------------------------
+verify_local_space
 copy_with_retries
 verify_size
 verify_checksum
