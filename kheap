@@ -15,7 +15,13 @@
 #      ephemeral toolbox container named "kheap", using jattach from that
 #      container.
 #
-# Thread dump collection (always attempted, cascading):
+# Dry-run (default):
+#   Without --force the script validates all inputs, detects the Java PID,
+#   checks remote and local disk space, and prints what it would do.
+#   No heap dump is created, no ephemeral container is injected, no signal
+#   is sent to the JVM. Pass --force to execute for real.
+#
+# Thread dump collection (--force only, cascading):
 #   1. jcmd Thread.print        (DIRECT, if jcmd available in target container)
 #   2. jattach threaddump       (DEBUG container, if running or after creation)
 #   3. kill -3 + kubectl logs   (universal fallback, any image)
@@ -24,23 +30,24 @@
 # Behavior:
 #   - Validates namespace, pod, target container and required local commands
 #   - Auto-detects Java PID if not explicitly provided
-#   - Collects thread dump (cascading, best-effort)
-#   - Creates heap dump inside the target container filesystem
-#   - Copies the heap dump locally
-#   - Verifies local/remote size match (+ optional checksum)
-#   - Compresses locally with gzip
-#   - Removes the remote heap dump after successful copy
+#   - Checks remote and local disk space before any write
+#   - Collects thread dump (cascading, best-effort) [--force only]
+#   - Creates heap dump inside the target container filesystem [--force only]
+#   - Copies the heap dump locally [--force only]
+#   - Verifies local/remote size match (+ optional checksum) [--force only]
+#   - Compresses locally with gzip [--force only]
+#   - Removes the remote heap dump after successful copy [--force only]
 #
 # Notes:
-#   - DIRECT mode is best-effort only, because application containers may not
+#   - DIRECT mode is best-effort only: application containers may not
 #     contain the required Java diagnostic tools
 #   - DEBUG mode is the supported fallback for tool-poor images
 #   - Thread dump is always attempted regardless of --direct-only / --debug-only
 #   - collect_thread_dump is called AFTER mode selection, so when running in
 #     AUTO or DEBUG mode the debug container is guaranteed to be up before
 #     thread dump method 2 (jattach) is attempted
-#   - On macOS, --since-time in kubectl logs requires GNU date for reliable
-#     RFC3339 formatting. Install via: brew install coreutils
+#   - PID detection falls back to /proc scan for BusyBox images where
+#     ps -eo is unavailable
 #
 # Requirements:
 #   - kubectl configured and authorized
@@ -51,18 +58,15 @@
 #   ./kheap -n <namespace> -p <pod> [-c <container>] \
 #       [-P <java_pid>] [-i <toolbox_image>] [-r <remote_dir>] \
 #       [-o <output_dir>] [--no-gzip] [--keep-remote] [--checksum] \
-#       [--direct-only] [--debug-only]
+#       [--direct-only] [--debug-only] [--force]
 #
 # Examples:
 #   ./kheap -n pt-healthcheck -p fanny-547bb857d8-jq59m
-#
-#   ./kheap -n pt-healthcheck -p fanny-547bb857d8-jq59m -c app
-#
-#   ./kheap -n pt-healthcheck -p fanny-547bb857d8-jq59m --direct-only
-#
-#   ./kheap -n pt-healthcheck -p fanny-547bb857d8-jq59m --debug-only
-#
-#   ./kheap -n pt-healthcheck -p fanny-547bb857d8-jq59m --checksum
+#   ./kheap -n pt-healthcheck -p fanny-547bb857d8-jq59m --force
+#   ./kheap -n pt-healthcheck -p fanny-547bb857d8-jq59m -c app --force
+#   ./kheap -n pt-healthcheck -p fanny-547bb857d8-jq59m --direct-only --force
+#   ./kheap -n pt-healthcheck -p fanny-547bb857d8-jq59m --debug-only --force
+#   ./kheap -n pt-healthcheck -p fanny-547bb857d8-jq59m --checksum --force
 #
 # Default toolbox image:
 #   registry.dasrn.generali.it/gbs/spring-boot-demo:kheap
@@ -81,6 +85,7 @@ KEEP_REMOTE=false
 DIRECT_ONLY=false
 DEBUG_ONLY=false
 CHECKSUM=false
+DRY_RUN=true
 
 DEFAULT_IMAGE="registry.dasrn.generali.it/gbs/spring-boot-demo:kheap"
 TOOL_IMAGE="${KHEAP_IMAGE:-$DEFAULT_IMAGE}"
@@ -99,10 +104,20 @@ FINAL_FILE=""
 MODE_USED=""
 
 # Globals mutated by collect_thread_dump:
-#   THREAD_DUMP_FILE   - path to saved thread dump file (empty if not collected)
-#   THREAD_DUMP_METHOD - human-readable label of the method used
+#   THREAD_DUMP_FILE     - path to saved thread dump file (empty if not collected)
+#   THREAD_DUMP_METHOD   - human-readable label of the method used
+#   THREAD_DUMP_COMPLETE - true only after thread dump is fully written and verified non-empty
 THREAD_DUMP_FILE=""
 THREAD_DUMP_METHOD=""
+THREAD_DUMP_COMPLETE=false
+
+# REMOTE_SIZE: set by verify_local_space (actual bytes after dump), reused by verify_size
+# to avoid a redundant wc -c exec on the remote container.
+REMOTE_SIZE=""
+
+# EST_DUMP_SIZE: set by verify_remote_space (RSS-based estimate, bytes).
+# Used by verify_local_space in dry-run mode when no actual file exists yet.
+EST_DUMP_SIZE=""
 
 # Track whether the final output file is complete and safe to keep.
 # Set to true only after copy + verify succeed.
@@ -110,7 +125,7 @@ OUTPUT_COMPLETE=false
 
 usage() {
   cat <<EOF
-Usage: $0 -n <namespace> -p <pod> [-c <container>] [-P <pid>] [-i <image>] [-r <remote_dir>] [-o <output_dir>] [--no-gzip] [--keep-remote] [--checksum] [--direct-only] [--debug-only]
+Usage: $0 -n <namespace> -p <pod> [-c <container>] [-P <pid>] [-i <image>] [-r <remote_dir>] [-o <output_dir>] [--no-gzip] [--keep-remote] [--checksum] [--direct-only] [--debug-only] [--force]
 
 Options:
   -n <namespace>     Kubernetes namespace
@@ -125,21 +140,26 @@ Options:
   --checksum         Verify MD5 checksum after copy (in addition to size check)
   --direct-only      Use DIRECT mode only, do not fall back to DEBUG mode
   --debug-only       Use DEBUG mode only, skip DIRECT mode
+  --force            Execute for real (default: dry-run, no writes, no signals)
   -h, --help         Show this help
+
+Dry-run (default):
+  Without --force the script validates all inputs, detects the Java PID,
+  checks remote and local disk space, and prints what it would do.
+  No heap dump is created, no ephemeral container is injected, no signal
+  is sent to the JVM.
 
 Environment:
   KHEAP_IMAGE        Override default toolbox image
 
-Thread dump:
+Thread dump (--force only):
   Always attempted before the heap dump, in cascading order:
     1. jcmd Thread.print  (if available in target container)
     2. jattach threaddump (via debug container)
-    3. kill -3 + kubectl logs (universal fallback)
+    3. kill -3 + kubectl logs (universal fallback, --since=60s)
   Failure is non-fatal: a warning is emitted and execution continues.
 
 Notes:
-  - On macOS, install GNU coreutils (brew install coreutils) for reliable
-    RFC3339 date formatting used by --since-time in kubectl logs.
   - --checksum uses md5sum (Linux) or md5 (macOS) automatically.
 EOF
 }
@@ -163,7 +183,9 @@ require_cmd() {
 # Cleanup on error
 #
 # Removes partial local files ONLY if the output was not yet marked complete.
-# Thread dump files are always removed on error (they may be partial).
+# Thread dump files are removed only if THREAD_DUMP_COMPLETE is false,
+# meaning the file may be partial. A fully written thread dump is preserved
+# even when the heap dump copy subsequently fails.
 # The final compressed file is never removed here: if we reached compression,
 # the data was already verified and the uncompressed source is gone.
 # -----------------------------
@@ -184,7 +206,7 @@ cleanup_on_error() {
     fi
   fi
 
-  if [[ -n "${THREAD_DUMP_FILE:-}" && -f "$THREAD_DUMP_FILE" ]]; then
+  if [[ "$THREAD_DUMP_COMPLETE" = false && -n "${THREAD_DUMP_FILE:-}" && -f "$THREAD_DUMP_FILE" ]]; then
     log "Removing partial thread dump file: $THREAD_DUMP_FILE"
     rm -f "$THREAD_DUMP_FILE" || true
   fi
@@ -211,6 +233,7 @@ while [[ $# -gt 0 ]]; do
     --checksum)    CHECKSUM=true;    shift 1 ;;
     --direct-only) DIRECT_ONLY=true; shift 1 ;;
     --debug-only)  DEBUG_ONLY=true;  shift 1 ;;
+    --force)       DRY_RUN=false;    shift 1 ;;
     -h|--help) usage; exit 0 ;;
     *) usage; die "Unknown argument: $1" ;;
   esac
@@ -220,6 +243,10 @@ done
 [[ "$DIRECT_ONLY" = true && "$DEBUG_ONLY" = true ]] && die "--direct-only and --debug-only are mutually exclusive."
 
 require_cmd kubectl awk grep date gzip
+
+if [[ "$DRY_RUN" = true ]]; then
+  log "[DRY-RUN] Validation and space checks only. Pass --force to execute."
+fi
 
 log "Using kheap image: $TOOL_IMAGE"
 
@@ -273,37 +300,45 @@ FINAL_FILE="$LOCAL_HPROF"
 # -----------------------------
 # Common helpers
 # -----------------------------
+
+# In dry-run mode: only checks existence and writability, does not create.
+# In --force mode: creates the directory if missing, then verifies.
 validate_remote_dir() {
   log "Validating remote directory on target container: $REMOTE_DIR"
-  kubectl -n "$NS" exec "$POD" -c "$CONTAINER" -- sh -lc "
-    mkdir -p '$REMOTE_DIR' &&
-    test -d '$REMOTE_DIR' &&
-    test -w '$REMOTE_DIR'
-  " >/dev/null || return 1
+  if [[ "$DRY_RUN" = true ]]; then
+    kubectl -n "$NS" exec "$POD" -c "$CONTAINER" -- sh -c "
+      test -d '$REMOTE_DIR' &&
+      test -w '$REMOTE_DIR'
+    " >/dev/null || return 1
+  else
+    kubectl -n "$NS" exec "$POD" -c "$CONTAINER" -- sh -c "
+      mkdir -p '$REMOTE_DIR' &&
+      test -d '$REMOTE_DIR' &&
+      test -w '$REMOTE_DIR'
+    " >/dev/null || return 1
+  fi
 }
 
 # Matches only the java binary (absolute or basename) to avoid false positives
 # from processes like 'javaagent-wrapper' or 'java-service-proxy'.
+# Falls back to /proc scan for BusyBox environments where ps -eo is unavailable.
 detect_java_pid_in_container() {
-  kubectl -n "$NS" exec "$POD" -c "$CONTAINER" -- sh -lc \
-    "ps -eo pid,args 2>/dev/null | awk '\$2==\"java\" || \$2 ~ /\/java\$/ {print \$1; exit}'" \
-    2>/dev/null || true
+  kubectl -n "$NS" exec "$POD" -c "$CONTAINER" -- sh -c '
+    pid="$(ps -eo pid,args 2>/dev/null | awk "\$2==\"java\" || \$2 ~ /\/java$/ {print \$1; exit}")"
+    if [ -z "$pid" ]; then
+      for d in /proc/[0-9]*; do
+        comm="$(cat "$d/comm" 2>/dev/null || true)"
+        [ "$comm" = "java" ] && { pid="${d#/proc/}"; break; }
+      done
+    fi
+    echo "$pid"
+  ' 2>/dev/null || true
 }
 
 # Uses 'test -s' instead of 'ls': verifies existence and non-zero size,
 # more reliable across minimal shell environments.
-#
-# Distinguishes two failure cases:
-#   - exec itself fails (RBAC, network, pod not reachable): warns and returns 2
-#   - exec succeeds but file is absent or empty: returns 1
 verify_remote_file_exists() {
-  local exec_out
-  if ! exec_out="$(kubectl -n "$NS" exec "$POD" -c "$CONTAINER" -- sh -lc "test -s '$REMOTE_HPROF' && echo ok" 2>&1)"; then
-    warn "verify_remote_file_exists: exec into container failed: $exec_out"
-    return 2
-  fi
-  [[ "$exec_out" = "ok" ]] || return 1
-  return 0
+  kubectl -n "$NS" exec "$POD" -c "$CONTAINER" -- sh -c "test -s '$REMOTE_HPROF'" >/dev/null 2>&1
 }
 
 copy_heap_dump() {
@@ -311,24 +346,34 @@ copy_heap_dump() {
     return 0
   fi
 
+  # Fallback: pipe directly without a shell to avoid profile script contamination
+  # of the binary hprof stream.
   log "kubectl cp failed, trying fallback via cat..."
-  kubectl -n "$NS" exec "$POD" -c "$CONTAINER" -- sh -lc "cat '$REMOTE_HPROF'" > "$LOCAL_HPROF"
+  kubectl -n "$NS" exec "$POD" -c "$CONTAINER" -- cat "$REMOTE_HPROF" > "$LOCAL_HPROF"
 }
 
 # -----------------------------
 # Size verification
+#
+# Reuses REMOTE_SIZE set by verify_local_space to avoid a redundant
+# wc -c exec on the remote container. Falls back to re-measuring if
+# verify_local_space was skipped or failed.
 # -----------------------------
 verify_size() {
-  local remote_size local_size
+  local local_size
 
   log "Verifying remote/local file size..."
-  remote_size="$(kubectl -n "$NS" exec "$POD" -c "$CONTAINER" -- sh -lc "wc -c < '$REMOTE_HPROF'" 2>/dev/null | tr -d '[:space:]')"
-  [[ -n "$remote_size" ]] || die "Could not determine remote heap dump size."
+
+  if [[ -z "$REMOTE_SIZE" ]]; then
+    REMOTE_SIZE="$(kubectl -n "$NS" exec "$POD" -c "$CONTAINER" -- \
+      sh -c "wc -c < '$REMOTE_HPROF'" 2>/dev/null | tr -d '[:space:]')"
+  fi
+  [[ -n "$REMOTE_SIZE" ]] || die "Could not determine remote heap dump size."
 
   local_size="$(wc -c < "$LOCAL_HPROF" | tr -d '[:space:]')"
   [[ -n "$local_size" ]] || die "Could not determine local heap dump size."
 
-  [[ "$remote_size" = "$local_size" ]] || die "Size mismatch after copy: remote=$remote_size local=$local_size"
+  [[ "$REMOTE_SIZE" = "$local_size" ]] || die "Size mismatch after copy: remote=$REMOTE_SIZE local=$local_size"
   log "Size verification OK: $local_size bytes"
 }
 
@@ -344,8 +389,7 @@ verify_checksum() {
 
   local remote_md5 local_md5
 
-  # Try md5sum first, fall back to md5 (BusyBox/Alpine)
-  remote_md5="$(kubectl -n "$NS" exec "$POD" -c "$CONTAINER" -- sh -lc \
+  remote_md5="$(kubectl -n "$NS" exec "$POD" -c "$CONTAINER" -- sh -c \
     "md5sum '$REMOTE_HPROF' 2>/dev/null | awk '{print \$1}' || md5 -q '$REMOTE_HPROF' 2>/dev/null || true" \
     2>/dev/null | tr -d '[:space:]')"
 
@@ -361,14 +405,12 @@ verify_checksum() {
   log "MD5 checksum OK: $local_md5"
 }
 
+# gzip -6: better speed/ratio tradeoff than -9 for large hprof files.
 compress_local_file() {
   if [[ "$NO_GZIP" = false ]]; then
-    # Set FINAL_FILE before invoking gzip: if gzip dies mid-run the cleanup
-    # handler knows which file to look for, and the uncompressed source will
-    # already be gone (gzip removes it in-place).
-    FINAL_FILE="$LOCAL_GZ"
     log "Compressing locally..."
-    gzip -9 -f "$LOCAL_HPROF"
+    gzip -6 -f "$LOCAL_HPROF"
+    FINAL_FILE="$LOCAL_GZ"
     ls -lh "$FINAL_FILE"
   else
     FINAL_FILE="$LOCAL_HPROF"
@@ -378,54 +420,114 @@ compress_local_file() {
 cleanup_remote_file() {
   if [[ "$KEEP_REMOTE" = false ]]; then
     log "Removing remote heap dump: $REMOTE_HPROF"
-    kubectl -n "$NS" exec "$POD" -c "$CONTAINER" -- sh -lc "rm -f '$REMOTE_HPROF'" \
+    kubectl -n "$NS" exec "$POD" -c "$CONTAINER" -- sh -c "rm -f '$REMOTE_HPROF'" \
       || warn "Remote file cleanup failed."
   else
     log "Keeping remote heap dump as requested."
   fi
 }
 
-verify_local_space() {
-  local remote_size local_free needed
+# -----------------------------
+# verify_remote_space
+#
+# Estimates heap dump size from process RSS (VmRSS in /proc/<pid>/status)
+# and checks available space in REMOTE_DIR inside the target container.
+# Called after PID detection, before the dump is created, in both dry-run
+# and --force mode.
+#
+# Sets EST_DUMP_SIZE (bytes) for reuse by verify_local_space in dry-run mode.
+# -----------------------------
+verify_remote_space() {
+  local pid="$1"
+  local rss_kb remote_free
 
-  remote_size="$(kubectl -n "$NS" exec "$POD" -c "$CONTAINER" -- \
-    sh -c "wc -c < '$REMOTE_HPROF'" 2>/dev/null | tr -d '[:space:]')"
-  [[ -n "$remote_size" ]] || { warn "Cannot determine remote size, skipping space check."; return 0; }
+  log "Checking remote disk space (RSS estimate)..."
+
+  rss_kb="$(kubectl -n "$NS" exec "$POD" -c "$CONTAINER" -- \
+    sh -c "awk '/VmRSS/ {print \$2}' /proc/$pid/status" 2>/dev/null | tr -d '[:space:]')"
+
+  if [[ -z "$rss_kb" ]]; then
+    warn "Cannot read VmRSS for PID $pid, skipping remote space check."
+    return 0
+  fi
+
+  EST_DUMP_SIZE=$(( rss_kb * 1024 ))
+
+  remote_free="$(kubectl -n "$NS" exec "$POD" -c "$CONTAINER" -- \
+    sh -c "df -Pk '$REMOTE_DIR' | awk 'NR==2 {print \$4 * 1024}'" 2>/dev/null | tr -d '[:space:]')"
+
+  if [[ -z "$remote_free" ]]; then
+    warn "Cannot determine free space in $REMOTE_DIR, skipping remote space check."
+    return 0
+  fi
+
+  (( remote_free > EST_DUMP_SIZE )) || \
+    die "Insufficient space in $REMOTE_DIR on pod: estimated dump ~$EST_DUMP_SIZE bytes, free $remote_free bytes. Use -r to point to a larger volume."
+
+  log "Remote space OK: estimated dump ~$EST_DUMP_SIZE bytes, free $remote_free bytes."
+}
+
+# -----------------------------
+# verify_local_space
+#
+# --force mode: reads actual dump size from the remote file (sets REMOTE_SIZE
+#   global for reuse by verify_size), checks local free space.
+# Dry-run mode: uses EST_DUMP_SIZE set by verify_remote_space.
+#
+# Without --no-gzip: requires 2x file size locally (hprof + gz coexist during
+# compression). With --no-gzip: 10% margin.
+# -----------------------------
+verify_local_space() {
+  local size local_free needed
+
+  if [[ "$DRY_RUN" = false ]]; then
+    REMOTE_SIZE="$(kubectl -n "$NS" exec "$POD" -c "$CONTAINER" -- \
+      sh -c "wc -c < '$REMOTE_HPROF'" 2>/dev/null | tr -d '[:space:]')"
+    [[ -n "$REMOTE_SIZE" ]] || { warn "Cannot determine remote dump size, skipping local space check."; return 0; }
+    size="$REMOTE_SIZE"
+  else
+    if [[ -z "$EST_DUMP_SIZE" ]]; then
+      warn "No dump size estimate available, skipping local space check."
+      return 0
+    fi
+    size="$EST_DUMP_SIZE"
+    log "Local space check using RSS-based estimate: $size bytes."
+  fi
 
   local_free="$(df -Pk "$OUTPUT_DIR" | awk 'NR==2 {print $4 * 1024}')"
   [[ -n "$local_free" ]] || { warn "Cannot determine local free space, skipping check."; return 0; }
 
-  # Without --no-gzip we need room for hprof + gz simultaneously during compression.
-  # gz worst case ~= original size, so require 2x. With --no-gzip, 1.1x margin.
   if [[ "$NO_GZIP" = false ]]; then
-    needed=$(( remote_size * 2 ))
+    needed=$(( size * 2 ))
   else
-    needed=$(( remote_size + remote_size / 10 ))
+    needed=$(( size + size / 10 ))
   fi
 
   (( local_free > needed )) || \
-    die "Insufficient local space in $OUTPUT_DIR: need ~$needed bytes, have $local_free."
+    die "Insufficient local space in $OUTPUT_DIR: need ~$needed bytes, have $local_free bytes."
+
+  log "Local space OK: need ~$needed bytes, free $local_free bytes."
 }
 
 # -----------------------------
 # copy_with_retries
 #
-# Uses $(( )) arithmetic instead of (( )) to avoid unreliable exit codes
-# under set -euo pipefail: (( expr )) returns 1 when the result is zero
-# (e.g. post-increment of 0), which trips set -e even with || true guards.
+# Uses an explicit counter loop instead of brace expansion {1..3} to avoid
+# unreliable arithmetic exit codes under set -euo pipefail.
+# 3 retries are sufficient given the pre-flight space check.
 # -----------------------------
 copy_with_retries() {
   local attempt=0
-  local max=12
+  local max=3
 
   log "Copying heap dump locally to: $LOCAL_HPROF"
 
-  while [[ "$attempt" -lt "$max" ]]; do
-    attempt=$(( attempt + 1 ))
+  while (( attempt < max )); do
+    (( attempt++ )) || true
     if copy_heap_dump; then
       break
     fi
-    if [[ "$attempt" -eq "$max" ]]; then
+    if (( attempt == max )); then
       die "Copy failed after $max retries."
     fi
     log "Copy failed. Retrying ($attempt/$max) in 5s..."
@@ -438,18 +540,18 @@ copy_with_retries() {
 }
 
 # -----------------------------
-# Thread dump collection
+# Thread dump collection (--force mode only)
 # Always attempted, cascading:
 #   1. jcmd Thread.print       (target container, DIRECT)
 #   2. jattach threaddump      (debug container)
 #   3. kill -3 + kubectl logs  (universal fallback)
 # Non-fatal: warns and returns on failure.
 #
-# Mutates globals: THREAD_DUMP_FILE, THREAD_DUMP_METHOD
+# Mutates globals: THREAD_DUMP_FILE, THREAD_DUMP_METHOD, THREAD_DUMP_COMPLETE
 #
-# NOTE: this function is called AFTER mode selection (heap dump), so when
-# running in AUTO or DEBUG mode the debug container is already running by
-# the time method 2 is attempted. No race condition.
+# NOTE: called AFTER mode selection (heap dump), so when running in AUTO or
+# DEBUG mode the debug container is already running by the time method 2 is
+# attempted. No race condition.
 # -----------------------------
 is_debug_container_running() {
   kubectl -n "$NS" get pod "$POD" \
@@ -465,6 +567,7 @@ collect_thread_dump() {
 
   # ------------------------------------------------------------------
   # Method 1: jcmd inside target container (skip if --debug-only)
+  # Uses sh -lc to pick up jcmd from PATH configured in login profile.
   # ------------------------------------------------------------------
   if [[ "$DEBUG_ONLY" != true ]]; then
     if kubectl -n "$NS" exec "$POD" -c "$CONTAINER" -- \
@@ -475,6 +578,7 @@ collect_thread_dump() {
           && [[ -s "$out_file" ]]; then
         THREAD_DUMP_FILE="$out_file"
         THREAD_DUMP_METHOD="jcmd (DIRECT)"
+        THREAD_DUMP_COMPLETE=true
         log "Thread dump saved: $out_file"
         return 0
       fi
@@ -486,8 +590,7 @@ collect_thread_dump() {
   # ------------------------------------------------------------------
   # Method 2: jattach threaddump via debug container (skip if --direct-only)
   # The debug container is guaranteed to be running at this point when
-  # in AUTO or DEBUG mode, because collect_thread_dump is called after
-  # run_debug_mode completes successfully.
+  # in AUTO or DEBUG mode.
   # ------------------------------------------------------------------
   if [[ "$DIRECT_ONLY" != true ]]; then
     if is_debug_container_running; then
@@ -497,6 +600,7 @@ collect_thread_dump() {
           && [[ -s "$out_file" ]]; then
         THREAD_DUMP_FILE="$out_file"
         THREAD_DUMP_METHOD="jattach (DEBUG container)"
+        THREAD_DUMP_COMPLETE=true
         log "Thread dump saved: $out_file"
         return 0
       fi
@@ -508,36 +612,28 @@ collect_thread_dump() {
   fi
 
   # ------------------------------------------------------------------
-  # Method 3: kill -3 (SIGQUIT) + kubectl logs capture
+  # Method 3: kill -3 (SIGQUIT) + kubectl logs capture.
   # Works on any image as long as exec is allowed.
   #
-  # IMPORTANT: Before sending SIGQUIT, verify that the PID is visible
-  # inside the target container's PID namespace. If JAVA_PID was
-  # auto-detected from the debug container (which may share the host
-  # PID namespace), the PID could differ inside the target container,
-  # and kill -3 could signal the wrong process.
+  # Uses --since=60s instead of --since-time to avoid clock skew between
+  # the local machine and cluster nodes causing log lines to be missed.
   #
-  # NOTE: --since-time requires RFC3339 format (YYYY-MM-DDTHH:MM:SSZ).
-  # On Linux this is provided by GNU date. On macOS, install GNU coreutils:
-  #   brew install coreutils
-  # The format string used here (%Y-%m-%dT%H:%M:%SZ) is compatible with
-  # both GNU date and BSD date (macOS built-in), so no gdate wrapper needed.
+  # IMPORTANT: Verify PID visibility in the target container's PID namespace
+  # before sending SIGQUIT. If JAVA_PID was auto-detected from the debug
+  # container (which may share the host PID namespace), the PID could differ
+  # inside the target container.
   # ------------------------------------------------------------------
   log "Thread dump method 3: kill -3 (SIGQUIT) + kubectl logs capture..."
 
-  # Verify PID is accessible in target container before sending signal.
   if ! kubectl -n "$NS" exec "$POD" -c "$CONTAINER" -- \
-      sh -lc "ls /proc/$pid/exe >/dev/null 2>&1" 2>/dev/null; then
+      sh -c "ls /proc/$pid/exe >/dev/null 2>&1" 2>/dev/null; then
     warn "PID $pid not visible in target container's PID namespace. Skipping kill -3."
     warn "Thread dump not collected."
     return 0
   fi
 
-  local pre_ts
-  pre_ts="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
-
   if ! kubectl -n "$NS" exec "$POD" -c "$CONTAINER" -- \
-      sh -lc "kill -3 '$pid'" 2>/dev/null; then
+      sh -c "kill -3 '$pid'" 2>/dev/null; then
     warn "Thread dump method 3 (kill -3) failed: could not send SIGQUIT."
     warn "Thread dump not collected."
     return 0
@@ -547,10 +643,11 @@ collect_thread_dump() {
   sleep 3
 
   if kubectl -n "$NS" logs "$POD" -c "$CONTAINER" \
-      --since-time="$pre_ts" > "$out_file" 2>/dev/null \
+      --since=60s > "$out_file" 2>/dev/null \
       && [[ -s "$out_file" ]]; then
     THREAD_DUMP_FILE="$out_file"
     THREAD_DUMP_METHOD="kill -3 / SIGQUIT (stdout capture)"
+    THREAD_DUMP_COMPLETE=true
     log "Thread dump saved: $out_file"
     return 0
   fi
@@ -565,13 +662,9 @@ collect_thread_dump() {
 # DIRECT mode helpers
 # -----------------------------
 
-# Returns the first available diagnostic tool found in the target container:
-# "jcmd", "jattach", or "none".
-# Always returns one of these three strings; never returns empty string.
-# The "none" case is handled by the caller (run_direct_mode returns 1).
+# Uses sh -lc to pick up jcmd/jattach from login-profile PATH in the container.
 direct_detect_tool() {
-  local tool
-  tool="$(kubectl -n "$NS" exec "$POD" -c "$CONTAINER" -- sh -lc '
+  kubectl -n "$NS" exec "$POD" -c "$CONTAINER" -- sh -lc '
     if command -v jcmd >/dev/null 2>&1; then
       echo jcmd
     elif command -v jattach >/dev/null 2>&1; then
@@ -579,10 +672,7 @@ direct_detect_tool() {
     else
       echo none
     fi
-  ' 2>/dev/null)" || true
-
-  # Normalize: if exec failed entirely, tool will be empty; treat as none.
-  echo "${tool:-none}"
+  ' 2>/dev/null || true
 }
 
 # Mutates globals: JAVA_PID, MODE_USED
@@ -598,6 +688,7 @@ run_direct_mode() {
   }
 
   tool="$(direct_detect_tool)"
+  [[ -n "$tool" ]] || tool="none"
 
   if [[ "$tool" = "none" ]]; then
     warn "DIRECT mode: neither jcmd nor jattach found in target container."
@@ -619,6 +710,19 @@ run_direct_mode() {
 
   log "DIRECT mode: using Java PID: $pid"
 
+  verify_remote_space "$pid"
+
+  if [[ "$DRY_RUN" = true ]]; then
+    if [[ "$tool" = "jcmd" ]]; then
+      log "[DRY-RUN] Would run: jcmd '$pid' GC.heap_dump '$REMOTE_HPROF'"
+    else
+      log "[DRY-RUN] Would run: jattach '$pid' dumpheap '$REMOTE_HPROF'"
+    fi
+    JAVA_PID="$pid"
+    MODE_USED="DIRECT"
+    return 0
+  fi
+
   if [[ "$tool" = "jcmd" ]]; then
     log "DIRECT mode: creating heap dump with jcmd at: $REMOTE_HPROF"
     kubectl -n "$NS" exec "$POD" -c "$CONTAINER" -- sh -lc \
@@ -635,15 +739,10 @@ run_direct_mode() {
       }
   fi
 
-  local verify_rc
-  verify_remote_file_exists; verify_rc=$?
-  if [[ "$verify_rc" -eq 2 ]]; then
-    warn "DIRECT mode: could not exec into container to verify heap dump."
-    return 1
-  elif [[ "$verify_rc" -ne 0 ]]; then
+  verify_remote_file_exists || {
     warn "DIRECT mode: heap dump file not found after dump."
     return 1
-  fi
+  }
 
   JAVA_PID="$pid"
   MODE_USED="DIRECT"
@@ -656,6 +755,8 @@ run_direct_mode() {
 
 # ensure_debug_container_running
 #
+# Only called in --force mode. In dry-run mode this function is skipped entirely:
+# no ephemeral container is injected.
 # Checks whether the ephemeral debug container already exists and is running.
 # If it exists but is not running (terminated/waiting), dies with a clear message.
 # If it does not exist, creates it via kubectl debug and waits up to 120s.
@@ -692,7 +793,7 @@ ensure_debug_container_running() {
       --target="$CONTAINER" \
       --container="$DEBUG_CONTAINER" \
       --quiet \
-      -- sh -lc "sleep infinity" 2>&1
+      -- sh -c "sleep infinity" 2>&1
   )"; then
     echo "$debug_output" >&2
     die "kubectl debug failed."
@@ -704,15 +805,14 @@ ensure_debug_container_running() {
 
   local i=0
   local max_wait=60  # iterations x 2s = 120s
-  while [[ "$i" -lt "$max_wait" ]]; do
-    i=$(( i + 1 ))
+  while (( i < max_wait )); do
+    (( i++ )) || true
 
     eph_status="$(kubectl -n "$NS" get pod "$POD" \
       -o jsonpath="{range .status.ephemeralContainerStatuses[*]}{.name} running={.state.running.startedAt} waiting={.state.waiting.reason} terminated={.state.terminated.reason}{'\n'}{end}" \
       2>/dev/null || true)"
     [[ -n "$eph_status" ]] && log "DEBUG mode status check $i/$max_wait: $(echo "$eph_status" | tr '\n' '; ')"
 
-    # Fail immediately if the container has already terminated.
     if echo "$eph_status" | grep -q "^${DEBUG_CONTAINER} .*terminated=[^[:space:]]"; then
       kubectl -n "$NS" describe pod "$POD" >&2 || true
       die "Debug container '$DEBUG_CONTAINER' terminated unexpectedly. Check image or cluster policy."
@@ -723,7 +823,7 @@ ensure_debug_container_running() {
       2>/dev/null | awk -F: -v c="$DEBUG_CONTAINER" '$1==c && $2!="" {print $2}')"
     [[ -n "$running" ]] && break
 
-    if [[ "$i" -eq "$max_wait" ]]; then
+    if (( i == max_wait )); then
       kubectl -n "$NS" describe pod "$POD" >&2 || true
       die "Timeout waiting for debug container '$DEBUG_CONTAINER' to start (120s elapsed)."
     fi
@@ -734,12 +834,22 @@ ensure_debug_container_running() {
   log "DEBUG mode: debug container '$DEBUG_CONTAINER' is Running."
 }
 
+# Falls back to /proc scan for BusyBox environments where ps -eo is unavailable.
+# If PID is not visible from the debug container (different PID namespace),
+# falls back to detection inside the target container.
 debug_detect_java_pid() {
   local pid=""
 
-  pid="$(kubectl -n "$NS" exec "$POD" -c "$DEBUG_CONTAINER" -- sh -lc \
-    "ps -eo pid,args 2>/dev/null | awk '\$2==\"java\" || \$2 ~ /\/java\$/ {print \$1; exit}'" \
-    2>/dev/null || true)"
+  pid="$(kubectl -n "$NS" exec "$POD" -c "$DEBUG_CONTAINER" -- sh -c '
+    pid="$(ps -eo pid,args 2>/dev/null | awk "\$2==\"java\" || \$2 ~ /\/java$/ {print \$1; exit}")"
+    if [ -z "$pid" ]; then
+      for d in /proc/[0-9]*; do
+        comm="$(cat "$d/comm" 2>/dev/null || true)"
+        [ "$comm" = "java" ] && { pid="${d#/proc/}"; break; }
+      done
+    fi
+    echo "$pid"
+  ' 2>/dev/null || true)"
 
   if [[ -z "$pid" ]]; then
     log "DEBUG mode: Java PID not visible from debug container, trying target container..."
@@ -759,37 +869,50 @@ run_debug_mode() {
 
   validate_remote_dir || die "Remote directory '$REMOTE_DIR' does not exist or is not writable."
 
-  ensure_debug_container_running
+  if [[ "$DRY_RUN" = true ]]; then
+    log "[DRY-RUN] Would create/reuse ephemeral debug container '$DEBUG_CONTAINER' (image: $TOOL_IMAGE)"
+  else
+    ensure_debug_container_running
 
-  debug_id="$(kubectl -n "$NS" exec "$POD" -c "$DEBUG_CONTAINER" -- sh -lc 'id' 2>/dev/null)" \
-    || die "Cannot exec into debug container '$DEBUG_CONTAINER'."
-  log "DEBUG mode: debug container identity: $debug_id"
+    debug_id="$(kubectl -n "$NS" exec "$POD" -c "$DEBUG_CONTAINER" -- sh -c 'id' 2>/dev/null)" \
+      || die "Cannot exec into debug container '$DEBUG_CONTAINER'."
+    log "DEBUG mode: debug container identity: $debug_id"
 
-  jattach_path="$(kubectl -n "$NS" exec "$POD" -c "$DEBUG_CONTAINER" -- sh -lc 'command -v jattach 2>/dev/null || true' 2>/dev/null || true)"
-  [[ -n "$jattach_path" ]] || die "jattach not found in kheap container. Bake it into the image."
-  log "DEBUG mode: jattach: $jattach_path"
+    jattach_path="$(kubectl -n "$NS" exec "$POD" -c "$DEBUG_CONTAINER" -- sh -lc 'command -v jattach 2>/dev/null || true' 2>/dev/null || true)"
+    [[ -n "$jattach_path" ]] || die "jattach not found in kheap container. Bake it into the image."
+    log "DEBUG mode: jattach: $jattach_path"
+  fi
 
   if [[ -n "$JAVA_PID" ]]; then
     pid="$JAVA_PID"
   else
     log "DEBUG mode: detecting Java PID..."
-    pid="$(debug_detect_java_pid)"
+    if [[ "$DRY_RUN" = true ]]; then
+      # Debug container not running in dry-run, detect from target container.
+      pid="$(detect_java_pid_in_container)"
+    else
+      pid="$(debug_detect_java_pid)"
+    fi
     [[ -n "$pid" ]] || die "Could not auto-detect Java PID. Provide it with -P <pid>."
   fi
 
   log "DEBUG mode: using Java PID: $pid"
+
+  verify_remote_space "$pid"
+
+  if [[ "$DRY_RUN" = true ]]; then
+    log "[DRY-RUN] Would run: jattach '$pid' dumpheap '$REMOTE_HPROF'"
+    JAVA_PID="$pid"
+    MODE_USED="DEBUG"
+    return 0
+  fi
+
   log "DEBUG mode: creating heap dump with jattach at: $REMOTE_HPROF"
   kubectl -n "$NS" exec "$POD" -c "$DEBUG_CONTAINER" -- sh -lc \
     "$jattach_path '$pid' dumpheap '$REMOTE_HPROF'" \
     || die "Heap dump failed. Cluster policy may block attach/ptrace even for root."
 
-  local verify_rc
-  verify_remote_file_exists; verify_rc=$?
-  if [[ "$verify_rc" -eq 2 ]]; then
-    die "Could not exec into target container to verify heap dump at '$REMOTE_HPROF'."
-  elif [[ "$verify_rc" -ne 0 ]]; then
-    die "Heap dump file not found in target container at '$REMOTE_HPROF'."
-  fi
+  verify_remote_file_exists || die "Heap dump file not found in target container at '$REMOTE_HPROF'."
 
   JAVA_PID="$pid"
   MODE_USED="DEBUG"
@@ -813,34 +936,51 @@ else
 fi
 
 # -----------------------------
-# Thread dump (always, cascading, after PID is known and debug container is up)
-# -----------------------------
-collect_thread_dump "$JAVA_PID"
-
-# -----------------------------
-# Copy / verify / compress / cleanup
-# Mark output complete only after verify succeeds, so cleanup_on_error
-# does not delete a fully verified heap dump if a later step fails.
+# Local space check
+# Runs in both modes: uses actual remote file size in --force, RSS estimate
+# in dry-run. REMOTE_SIZE is set here and reused by verify_size.
 # -----------------------------
 verify_local_space
-copy_with_retries
-verify_size
-verify_checksum
-OUTPUT_COMPLETE=true
-compress_local_file
-cleanup_remote_file
+
+# -----------------------------
+# Thread dump + copy pipeline: --force mode only
+# -----------------------------
+if [[ "$DRY_RUN" = false ]]; then
+  collect_thread_dump "$JAVA_PID"
+  copy_with_retries
+  verify_size
+  verify_checksum
+  OUTPUT_COMPLETE=true
+  compress_local_file
+  cleanup_remote_file
+else
+  log "[DRY-RUN] Would collect thread dump for PID $JAVA_PID."
+  log "[DRY-RUN] Would copy $REMOTE_HPROF to $LOCAL_HPROF."
+  if [[ "$NO_GZIP" = false ]]; then
+    log "[DRY-RUN] Would compress to $LOCAL_GZ (gzip -6)."
+  fi
+  if [[ "$CHECKSUM" = true ]]; then
+    log "[DRY-RUN] Would verify MD5 checksum after copy."
+  fi
+  if [[ "$KEEP_REMOTE" = false ]]; then
+    log "[DRY-RUN] Would remove remote file $REMOTE_HPROF after copy."
+  fi
+fi
 
 # -----------------------------
 # Summary
-# NOTE: the MODE_USED check below covers DIRECT and DEBUG only.
-# If a third mode is ever added, update this block accordingly.
 # -----------------------------
 gzip_label="$([[ "$NO_GZIP" = false ]] && echo "enabled" || echo "disabled")"
 keep_remote_label="$([[ "$KEEP_REMOTE" = true ]] && echo "yes" || echo "no")"
 checksum_label="$([[ "$CHECKSUM" = true ]] && echo "yes" || echo "no")"
+dryrun_label="$([[ "$DRY_RUN" = true ]] && echo "yes (pass --force to execute)" || echo "no")"
 
 if [[ "$MODE_USED" = "DEBUG" ]]; then
-  debug_container_label="$DEBUG_CONTAINER (REUSE, kept running)"
+  if [[ "$DRY_RUN" = true ]]; then
+    debug_container_label="$DEBUG_CONTAINER (not created, dry-run)"
+  else
+    debug_container_label="$DEBUG_CONTAINER (REUSE, kept running)"
+  fi
   tool_image_label="$TOOL_IMAGE"
 else
   debug_container_label="not used"
@@ -849,18 +989,24 @@ fi
 
 echo
 echo "================== KHEAP SUMMARY =================="
+echo "Dry-run          : $dryrun_label"
 echo "Mode used        : $MODE_USED"
 echo "Namespace        : $NS"
 echo "Pod              : $POD"
 echo "Target container : $CONTAINER"
 echo "Java PID         : $JAVA_PID"
 echo "Remote file      : $REMOTE_HPROF"
-echo "Local heap dump  : $FINAL_FILE"
-if [[ -n "$THREAD_DUMP_FILE" ]]; then
-  echo "Thread dump      : $THREAD_DUMP_FILE"
-  echo "Thread dump via  : $THREAD_DUMP_METHOD"
+if [[ "$DRY_RUN" = false ]]; then
+  echo "Local heap dump  : $FINAL_FILE"
+  if [[ -n "$THREAD_DUMP_FILE" ]]; then
+    echo "Thread dump      : $THREAD_DUMP_FILE"
+    echo "Thread dump via  : $THREAD_DUMP_METHOD"
+  else
+    echo "Thread dump      : not collected"
+  fi
 else
-  echo "Thread dump      : not collected"
+  echo "Local heap dump  : $LOCAL_HPROF (not created)"
+  echo "Thread dump      : not collected (dry-run)"
 fi
 echo "Debug container  : $debug_container_label"
 echo "Tool image       : $tool_image_label"
