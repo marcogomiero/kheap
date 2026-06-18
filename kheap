@@ -51,8 +51,7 @@
 #   ./kheap -n <namespace> -p <pod> [-c <container>] \
 #       [-P <java_pid>] [-i <toolbox_image>] [-r <remote_dir>] \
 #       [-o <output_dir>] [--no-gzip] [--keep-remote] [--checksum] \
-#       [--direct-only] [--debug-only] \
-#       [--thread-dump-count <N>] [--thread-dump-interval <S>]
+#       [--direct-only] [--debug-only]
 #
 # Examples:
 #   ./kheap -n pt-healthcheck -p fanny-547bb857d8-jq59m
@@ -64,8 +63,6 @@
 #   ./kheap -n pt-healthcheck -p fanny-547bb857d8-jq59m --debug-only
 #
 #   ./kheap -n pt-healthcheck -p fanny-547bb857d8-jq59m --checksum
-#
-#   ./kheap -n pt-healthcheck -p fanny-547bb857d8-jq59m --thread-dump-count 5 --thread-dump-interval 10
 #
 # Default toolbox image:
 #   registry.dasrn.generali.it/gbs/spring-boot-demo:kheap
@@ -102,17 +99,10 @@ FINAL_FILE=""
 MODE_USED=""
 
 # Globals mutated by collect_thread_dump:
-#   THREAD_DUMP_FILES  - array of paths to saved thread dump files (empty if none collected)
-#   THREAD_DUMP_METHOD - human-readable label of the method used (set by first successful dump)
-#   THREAD_DUMP_CURRENT_FILE - path of the thread dump currently being written (used by cleanup)
-THREAD_DUMP_FILES=()
+#   THREAD_DUMP_FILE   - path to saved thread dump file (empty if not collected)
+#   THREAD_DUMP_METHOD - human-readable label of the method used
+THREAD_DUMP_FILE=""
 THREAD_DUMP_METHOD=""
-THREAD_DUMP_CURRENT_FILE=""
-THREAD_DUMP_ARCHIVE=""
-
-# Thread dump sequence options
-THREAD_DUMP_COUNT=5
-THREAD_DUMP_INTERVAL=30
 
 # Track whether the final output file is complete and safe to keep.
 # Set to true only after copy + verify succeed.
@@ -120,24 +110,22 @@ OUTPUT_COMPLETE=false
 
 usage() {
   cat <<EOF
-Usage: $0 -n <namespace> -p <pod> [-c <container>] [-P <pid>] [-i <image>] [-r <remote_dir>] [-o <output_dir>] [--no-gzip] [--keep-remote] [--checksum] [--direct-only] [--debug-only] [--thread-dump-count <N>] [--thread-dump-interval <S>]
+Usage: $0 -n <namespace> -p <pod> [-c <container>] [-P <pid>] [-i <image>] [-r <remote_dir>] [-o <output_dir>] [--no-gzip] [--keep-remote] [--checksum] [--direct-only] [--debug-only]
 
 Options:
-  -n <namespace>            Kubernetes namespace
-  -p <pod>                  Pod name
-  -c <container>            Target container name (default: auto-detect first container)
-  -P <pid>                  Java PID (default: auto-detect)
-  -i <image>                Toolbox image for DEBUG mode ephemeral container
-  -r <remote_dir>           Remote directory inside target container (default: /tmp)
-  -o <output_dir>           Local output directory (default: current directory)
-  --no-gzip                 Do not compress the local heap dump
-  --keep-remote             Keep the remote heap dump file after successful copy
-  --checksum                Verify MD5 checksum after copy (in addition to size check)
-  --direct-only             Use DIRECT mode only, do not fall back to DEBUG mode
-  --debug-only              Use DEBUG mode only, skip DIRECT mode
-  --thread-dump-count <N>   Collect N sequential thread dumps (default: 5, max: 10)
-  --thread-dump-interval <S> Seconds between thread dumps when N > 1 (default: 30)
-  -h, --help                Show this help
+  -n <namespace>     Kubernetes namespace
+  -p <pod>           Pod name
+  -c <container>     Target container name (default: auto-detect first container)
+  -P <pid>           Java PID (default: auto-detect)
+  -i <image>         Toolbox image for DEBUG mode ephemeral container
+  -r <remote_dir>    Remote directory inside target container (default: /tmp)
+  -o <output_dir>    Local output directory (default: current directory)
+  --no-gzip          Do not compress the local heap dump
+  --keep-remote      Keep the remote heap dump file after successful copy
+  --checksum         Verify MD5 checksum after copy (in addition to size check)
+  --direct-only      Use DIRECT mode only, do not fall back to DEBUG mode
+  --debug-only       Use DEBUG mode only, skip DIRECT mode
+  -h, --help         Show this help
 
 Environment:
   KHEAP_IMAGE        Override default toolbox image
@@ -148,8 +136,6 @@ Thread dump:
     2. jattach threaddump (via debug container)
     3. kill -3 + kubectl logs (universal fallback)
   Failure is non-fatal: a warning is emitted and execution continues.
-  Use --thread-dump-count to collect multiple sequential snapshots.
-  Use --thread-dump-interval to control the delay between them (seconds).
 
 Notes:
   - On macOS, install GNU coreutils (brew install coreutils) for reliable
@@ -198,17 +184,9 @@ cleanup_on_error() {
     fi
   fi
 
-  # Remove only the thread dump file currently being written (may be partial).
-  # Completed thread dumps in a sequence are retained.
-  if [[ -n "${THREAD_DUMP_CURRENT_FILE:-}" && -f "$THREAD_DUMP_CURRENT_FILE" ]]; then
-    log "Removing partial thread dump file: $THREAD_DUMP_CURRENT_FILE"
-    rm -f "$THREAD_DUMP_CURRENT_FILE" || true
-  fi
-
-  # Remove partial thread dump archive if gzip was interrupted.
-  if [[ -n "${THREAD_DUMP_ARCHIVE:-}" && -f "$THREAD_DUMP_ARCHIVE" ]]; then
-    log "Removing partial thread dump archive: $THREAD_DUMP_ARCHIVE"
-    rm -f "$THREAD_DUMP_ARCHIVE" || true
+  if [[ -n "${THREAD_DUMP_FILE:-}" && -f "$THREAD_DUMP_FILE" ]]; then
+    log "Removing partial thread dump file: $THREAD_DUMP_FILE"
+    rm -f "$THREAD_DUMP_FILE" || true
   fi
 
   exit $rc
@@ -233,8 +211,6 @@ while [[ $# -gt 0 ]]; do
     --checksum)    CHECKSUM=true;    shift 1 ;;
     --direct-only) DIRECT_ONLY=true; shift 1 ;;
     --debug-only)  DEBUG_ONLY=true;  shift 1 ;;
-    --thread-dump-count)    THREAD_DUMP_COUNT="$2";    shift 2 ;;
-    --thread-dump-interval) THREAD_DUMP_INTERVAL="$2"; shift 2 ;;
     -h|--help) usage; exit 0 ;;
     *) usage; die "Unknown argument: $1" ;;
   esac
@@ -242,10 +218,6 @@ done
 
 [[ -z "$NS" || -z "$POD" ]] && { usage; die "Namespace and pod are required."; }
 [[ "$DIRECT_ONLY" = true && "$DEBUG_ONLY" = true ]] && die "--direct-only and --debug-only are mutually exclusive."
-
-[[ "$THREAD_DUMP_COUNT" =~ ^[1-9][0-9]*$ ]] || die "--thread-dump-count must be a positive integer."
-[[ "$THREAD_DUMP_COUNT" -le 10 ]] || die "--thread-dump-count cannot exceed 10."
-[[ "$THREAD_DUMP_INTERVAL" =~ ^[1-9][0-9]*$ ]] || die "--thread-dump-interval must be a positive integer (seconds)."
 
 require_cmd kubectl awk grep date gzip
 
@@ -451,28 +423,7 @@ copy_with_retries() {
 #   3. kill -3 + kubectl logs  (universal fallback)
 # Non-fatal: warns and returns on failure.
 #
-# Mutates globals: THREAD_DUMP_FILES (appends), THREAD_DUMP_METHOD, THREAD_DUMP_CURRENT_FILE
-#
-# NOTE: this function is called AFTER mode selection (heap dump), so when
-# running in AUTO or DEBUG mode the debug container is already running by
-# the time method 2 is attempted. No race condition.
-# -----------------------------
-# -----------------------------
-# Thread dump collection
-# Always attempted, cascading:
-#   1. jcmd Thread.print       (target container, DIRECT)
-#   2. jattach threaddump      (debug container)
-#   3. kill -3 + kubectl logs  (universal fallback)
-# Non-fatal: warns and returns on failure.
-#
-# Arguments:
-#   $1 - Java PID
-#   $2 - sequence index (used in filename; pass 1 for a single dump)
-#
-# Mutates globals:
-#   THREAD_DUMP_FILES         - appends the saved file path on success
-#   THREAD_DUMP_METHOD        - set to the method used (overwritten each call)
-#   THREAD_DUMP_CURRENT_FILE  - updated to the in-progress file path (cleanup sentinel)
+# Mutates globals: THREAD_DUMP_FILE, THREAD_DUMP_METHOD
 #
 # NOTE: this function is called AFTER mode selection (heap dump), so when
 # running in AUTO or DEBUG mode the debug container is already running by
@@ -486,12 +437,9 @@ is_debug_container_running() {
 
 collect_thread_dump() {
   local pid="$1"
-  local idx="$2"
-  local out_file="${OUTPUT_DIR%/}/${NS}_${POD}_${TS}_threaddump_${idx}.log"
+  local out_file="${OUTPUT_DIR%/}/${NS}_${POD}_${TS}_threaddump.log"
 
-  THREAD_DUMP_CURRENT_FILE="$out_file"
-
-  log "Collecting thread dump $idx/$THREAD_DUMP_COUNT for PID $pid..."
+  log "Collecting thread dump for PID $pid..."
 
   # ------------------------------------------------------------------
   # Method 1: jcmd inside target container (skip if --debug-only)
@@ -503,10 +451,9 @@ collect_thread_dump() {
       if kubectl -n "$NS" exec "$POD" -c "$CONTAINER" -- \
           sh -lc "jcmd '$pid' Thread.print" > "$out_file" 2>/dev/null \
           && [[ -s "$out_file" ]]; then
-        THREAD_DUMP_FILES+=("$out_file")
-        THREAD_DUMP_CURRENT_FILE=""
+        THREAD_DUMP_FILE="$out_file"
         THREAD_DUMP_METHOD="jcmd (DIRECT)"
-        log "Thread dump $idx saved: $out_file"
+        log "Thread dump saved: $out_file"
         return 0
       fi
       warn "Thread dump method 1 (jcmd) failed, trying next..."
@@ -526,10 +473,9 @@ collect_thread_dump() {
       if kubectl -n "$NS" exec "$POD" -c "$DEBUG_CONTAINER" -- \
           sh -lc "jattach '$pid' threaddump" > "$out_file" 2>/dev/null \
           && [[ -s "$out_file" ]]; then
-        THREAD_DUMP_FILES+=("$out_file")
-        THREAD_DUMP_CURRENT_FILE=""
+        THREAD_DUMP_FILE="$out_file"
         THREAD_DUMP_METHOD="jattach (DEBUG container)"
-        log "Thread dump $idx saved: $out_file"
+        log "Thread dump saved: $out_file"
         return 0
       fi
       warn "Thread dump method 2 (jattach) failed, trying next..."
@@ -561,8 +507,7 @@ collect_thread_dump() {
   if ! kubectl -n "$NS" exec "$POD" -c "$CONTAINER" -- \
       sh -lc "ls /proc/$pid/exe >/dev/null 2>&1" 2>/dev/null; then
     warn "PID $pid not visible in target container's PID namespace. Skipping kill -3."
-    warn "Thread dump $idx not collected."
-    THREAD_DUMP_CURRENT_FILE=""
+    warn "Thread dump not collected."
     return 0
   fi
 
@@ -572,8 +517,7 @@ collect_thread_dump() {
   if ! kubectl -n "$NS" exec "$POD" -c "$CONTAINER" -- \
       sh -lc "kill -3 '$pid'" 2>/dev/null; then
     warn "Thread dump method 3 (kill -3) failed: could not send SIGQUIT."
-    warn "Thread dump $idx not collected."
-    THREAD_DUMP_CURRENT_FILE=""
+    warn "Thread dump not collected."
     return 0
   fi
 
@@ -583,84 +527,16 @@ collect_thread_dump() {
   if kubectl -n "$NS" logs "$POD" -c "$CONTAINER" \
       --since-time="$pre_ts" > "$out_file" 2>/dev/null \
       && [[ -s "$out_file" ]]; then
-    THREAD_DUMP_FILES+=("$out_file")
-    THREAD_DUMP_CURRENT_FILE=""
+    THREAD_DUMP_FILE="$out_file"
     THREAD_DUMP_METHOD="kill -3 / SIGQUIT (stdout capture)"
-    log "Thread dump $idx saved: $out_file"
+    log "Thread dump saved: $out_file"
     return 0
   fi
 
   rm -f "$out_file" || true
-  THREAD_DUMP_CURRENT_FILE=""
   warn "Thread dump method 3 (kubectl logs capture) produced empty output."
-  warn "Thread dump $idx not collected."
+  warn "Thread dump not collected."
   return 0
-}
-
-# -----------------------------
-# collect_thread_dump_sequence
-#
-# Collects THREAD_DUMP_COUNT thread dumps, waiting THREAD_DUMP_INTERVAL
-# seconds between each one (no wait after the last dump).
-# Non-fatal: individual failures are reported but the sequence continues.
-# -----------------------------
-collect_thread_dump_sequence() {
-  local pid="$1"
-  local i
-
-  if [[ "$THREAD_DUMP_COUNT" -eq 1 ]]; then
-    collect_thread_dump "$pid" 1
-  else
-    log "Thread dump sequence: $THREAD_DUMP_COUNT dumps, ${THREAD_DUMP_INTERVAL}s interval."
-    for (( i = 1; i <= THREAD_DUMP_COUNT; i++ )); do
-      collect_thread_dump "$pid" "$i"
-      if [[ "$i" -lt "$THREAD_DUMP_COUNT" ]]; then
-        log "Waiting ${THREAD_DUMP_INTERVAL}s before next thread dump ($i/$THREAD_DUMP_COUNT done)..."
-        sleep "$THREAD_DUMP_INTERVAL"
-      fi
-    done
-    log "Thread dump sequence complete: ${#THREAD_DUMP_FILES[@]}/$THREAD_DUMP_COUNT collected."
-  fi
-}
-
-# -----------------------------
-# finalize_thread_dumps
-#
-# Concatenates all collected thread dump files into a single gzipped archive,
-# with a separator header before each dump. Individual files are removed after
-# successful merge. Sets THREAD_DUMP_ARCHIVE on success.
-#
-# No-op if no thread dumps were collected.
-# -----------------------------
-finalize_thread_dumps() {
-  local total="${#THREAD_DUMP_FILES[@]}"
-  [[ "$total" -eq 0 ]] && return 0
-
-  local combined="${OUTPUT_DIR%/}/${NS}_${POD}_${TS}_threaddump.log"
-  local gz="${combined}.gz"
-  local i=0
-
-  log "Merging $total thread dump(s) into archive: $gz"
-
-  for f in "${THREAD_DUMP_FILES[@]}"; do
-    i=$(( i + 1 ))
-    {
-      printf '=%.0s' {1..60}; echo
-      echo "THREAD DUMP $i/$total  |  $(basename "$f")"
-      printf '=%.0s' {1..60}; echo
-      cat "$f"
-      echo
-    } >> "$combined"
-  done
-
-  THREAD_DUMP_ARCHIVE="$gz"
-  gzip -9 -f "$combined"
-
-  for f in "${THREAD_DUMP_FILES[@]}"; do
-    rm -f "$f" || true
-  done
-
-  log "Thread dump archive ready: $gz"
 }
 
 # -----------------------------
@@ -917,8 +793,7 @@ fi
 # -----------------------------
 # Thread dump (always, cascading, after PID is known and debug container is up)
 # -----------------------------
-collect_thread_dump_sequence "$JAVA_PID"
-finalize_thread_dumps
+collect_thread_dump "$JAVA_PID"
 
 # -----------------------------
 # Copy / verify / compress / cleanup
@@ -958,11 +833,11 @@ echo "Target container : $CONTAINER"
 echo "Java PID         : $JAVA_PID"
 echo "Remote file      : $REMOTE_HPROF"
 echo "Local heap dump  : $FINAL_FILE"
-if [[ -n "$THREAD_DUMP_ARCHIVE" ]]; then
-  echo "Thread dumps     : ${#THREAD_DUMP_FILES[@]}/$THREAD_DUMP_COUNT collected (via $THREAD_DUMP_METHOD)"
-  echo "Thread dump archive: $THREAD_DUMP_ARCHIVE"
+if [[ -n "$THREAD_DUMP_FILE" ]]; then
+  echo "Thread dump      : $THREAD_DUMP_FILE"
+  echo "Thread dump via  : $THREAD_DUMP_METHOD"
 else
-  echo "Thread dumps     : not collected"
+  echo "Thread dump      : not collected"
 fi
 echo "Debug container  : $debug_container_label"
 echo "Tool image       : $tool_image_label"
