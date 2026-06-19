@@ -73,6 +73,8 @@
 
 set -euo pipefail
 
+KHEAP_VERSION="1.0.0"
+
 NS=""
 POD=""
 CONTAINER=""
@@ -241,6 +243,7 @@ while [[ $# -gt 0 ]]; do
 done
 
 [[ -z "$NS" || -z "$POD" ]] && { usage; die "Namespace and pod are required."; }
+log "Running kheap version $KHEAP_VERSION on pod $POD in namespace $NS"
 [[ "$DIRECT_ONLY" = true && "$DEBUG_ONLY" = true ]] && die "--direct-only and --debug-only are mutually exclusive."
 
 [[ "$THREAD_DUMP_COUNT" =~ ^[1-9][0-9]*$ ]] || die "--thread-dump-count must be a positive integer."
@@ -270,7 +273,6 @@ fi
 # Validate local output dir
 # -----------------------------
 mkdir -p "$OUTPUT_DIR" || die "Cannot create output directory: $OUTPUT_DIR"
-[[ -d "$OUTPUT_DIR" ]] || die "Output path is not a directory: $OUTPUT_DIR"
 [[ -w "$OUTPUT_DIR" ]] || die "Output directory is not writable: $OUTPUT_DIR"
 
 # -----------------------------
@@ -443,20 +445,6 @@ copy_with_retries() {
   ls -lh "$LOCAL_HPROF"
 }
 
-# -----------------------------
-# Thread dump collection
-# Always attempted, cascading:
-#   1. jcmd Thread.print       (target container, DIRECT)
-#   2. jattach threaddump      (debug container)
-#   3. kill -3 + kubectl logs  (universal fallback)
-# Non-fatal: warns and returns on failure.
-#
-# Mutates globals: THREAD_DUMP_FILES (appends), THREAD_DUMP_METHOD, THREAD_DUMP_CURRENT_FILE
-#
-# NOTE: this function is called AFTER mode selection (heap dump), so when
-# running in AUTO or DEBUG mode the debug container is already running by
-# the time method 2 is attempted. No race condition.
-# -----------------------------
 # -----------------------------
 # Thread dump collection
 # Always attempted, cascading:
@@ -645,9 +633,9 @@ finalize_thread_dumps() {
   for f in "${THREAD_DUMP_FILES[@]}"; do
     i=$(( i + 1 ))
     {
-      printf '=%.0s' {1..60}; echo
+      echo "============================================================"
       echo "THREAD DUMP $i/$total  |  $(basename "$f")"
-      printf '=%.0s' {1..60}; echo
+      echo "============================================================"
       cat "$f"
       echo
     } >> "$combined"

@@ -1,4 +1,6 @@
-FROM cgr.dev/chainguard/wolfi-base:latest AS builder
+ARG BASE_IMAGE=cgr.dev/chainguard/wolfi-base:latest
+
+FROM ${BASE_IMAGE} AS builder
 
 ARG JATTACH_VERSION=v2.2
 
@@ -11,7 +13,7 @@ RUN apk add --no-cache curl \
  && mkdir -p /usr/local/bin \
  && mv /tmp/jattach /usr/local/bin/jattach
 
-FROM cgr.dev/chainguard/wolfi-base:latest
+FROM ${BASE_IMAGE}
 
 USER root
 
