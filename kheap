@@ -80,7 +80,7 @@ POD=""
 CONTAINER=""
 JAVA_PID=""
 REMOTE_DIR="/tmp"
-OUTPUT_DIR="."
+OUTPUT_DIR="/appdomain/shared/dumps/docker_dump"
 NO_GZIP=false
 KEEP_REMOTE=false
 DIRECT_ONLY=false
@@ -962,3 +962,8 @@ echo
 
 trap - EXIT
 log "Done."
+
+echo "Download at: https://bazoomba.generali.it/dumps/docker_dump/$(basename "$FINAL_FILE")"
+if [[ -n "$THREAD_DUMP_ARCHIVE" ]]; then
+  echo "Download at: https://bazoomba.generali.it/dumps/docker_dump/$(basename "$THREAD_DUMP_ARCHIVE")"
+fi
